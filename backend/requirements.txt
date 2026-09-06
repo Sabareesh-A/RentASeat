@@ -1,0 +1,22 @@
+# RentASeat Lambda dependencies — Python 3.13, x86_64
+#
+# pg8000: pure-Python PostgreSQL DB-API 2.0 driver.
+# Chosen over psycopg2/psycopg3 because:
+#   - Zero native C extensions or system libraries required.
+#   - Installs and runs identically on macOS, Linux, and Lambda.
+#   - No cross-compilation or Docker build step needed.
+#
+# All three packages are pure Python — platform-independent wheels.
+# boto3/botocore are provided by the Lambda runtime and are NOT
+# included here to avoid bloating the deployment package.
+#
+# Versions are pinned or lower-bounded for reproducibility and
+# supply-chain safety. Update intentionally, not automatically.
+#
+# CVE note: pg8000 < 1.31.5 has CVE-2025-61385 (SQL injection via
+# pg8000.native.literal() with list input). We do not use that
+# function, but pinning to >= 1.31.5 removes the known vulnerability.
+pg8000>=1.31.5
+scramp==1.4.5
+python-dateutil>=2.8.2
+asn1crypto>=1.5.1

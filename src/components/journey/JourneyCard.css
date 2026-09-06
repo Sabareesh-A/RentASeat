@@ -1,0 +1,159 @@
+/* Journey Card Styles */
+
+.journey-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-lg);
+}
+
+.journey-card-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+}
+
+.journey-route {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.journey-location {
+  flex: 1;
+  min-width: 0;
+}
+
+.location-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: var(--gray-500);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.location-name {
+  font-weight: 600;
+  color: var(--gray-900);
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.journey-duration {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-shrink: 0;
+}
+
+.duration-time {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--gray-700);
+  white-space: nowrap;
+}
+
+.duration-line {
+  width: 40px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--primary), transparent);
+}
+
+.journey-info {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  background-color: var(--gray-50);
+  border-radius: var(--radius-lg);
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.info-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  color: var(--gray-500);
+  font-weight: 600;
+}
+
+.info-value {
+  font-weight: 600;
+  color: var(--gray-900);
+  font-size: 0.95rem;
+}
+
+.info-value.price {
+  color: var(--success);
+  font-size: 1.1rem;
+}
+
+.journey-driver {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.driver-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--primary-light);
+}
+
+.driver-name {
+  font-weight: 600;
+  color: var(--gray-900);
+  font-size: 0.95rem;
+}
+
+.driver-rating {
+  font-size: 0.875rem;
+  color: var(--gray-600);
+}
+
+.journey-vehicle {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.vehicle-detail {
+  font-size: 0.875rem;
+  color: var(--gray-600);
+  text-transform: capitalize;
+}
+
+.journey-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+}
+
+.journey-badges {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .journey-info {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .location-name {
+    font-size: 0.9rem;
+  }
+
+  .journey-footer {
+    flex-wrap: wrap;
+  }
+}

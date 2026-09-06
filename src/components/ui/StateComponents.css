@@ -1,0 +1,116 @@
+/* State Components Styles */
+
+.state-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--spacing-4xl) var(--spacing-lg);
+  min-height: 300px;
+}
+
+/* Loading State */
+.loading-state {
+  gap: var(--spacing-lg);
+}
+
+.spinner-large {
+  width: 48px;
+  height: 48px;
+  border: 4px solid var(--gray-200);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.loading-state p {
+  color: var(--gray-600);
+  font-weight: 500;
+  margin: 0;
+}
+
+/* Empty State */
+.empty-state {
+  gap: var(--spacing-md);
+}
+
+.empty-state-icon {
+  font-size: 4rem;
+  line-height: 1;
+  margin-bottom: var(--spacing-md);
+}
+
+.empty-state-title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--gray-900);
+}
+
+.empty-state-message {
+  margin: 0;
+  color: var(--gray-600);
+  max-width: 400px;
+  font-size: 1rem;
+}
+
+.empty-state-action {
+  margin-top: var(--spacing-lg);
+}
+
+/* Error State */
+.error-state {
+  gap: var(--spacing-md);
+}
+
+.error-state-icon {
+  font-size: 4rem;
+  margin-bottom: var(--spacing-md);
+}
+
+.error-state-title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--error);
+}
+
+.error-state-message {
+  margin: 0;
+  color: var(--gray-600);
+  max-width: 400px;
+  font-size: 1rem;
+}
+
+.error-state-action {
+  margin-top: var(--spacing-lg);
+}
+
+/* Page Loading */
+.page-loading {
+  padding: var(--spacing-lg) 0;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .state-container {
+    padding: var(--spacing-2xl) var(--spacing-md);
+    min-height: 250px;
+  }
+
+  .empty-state-icon,
+  .error-state-icon {
+    font-size: 3rem;
+  }
+
+  .empty-state-title,
+  .error-state-title {
+    font-size: 1.25rem;
+  }
+
+  .empty-state-message,
+  .error-state-message {
+    font-size: 0.9375rem;
+  }
+}
