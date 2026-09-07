@@ -1,10 +1,14 @@
-name: RentASeat CI
+name: RentASeat CI/CD
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   security-and-build:
@@ -31,3 +35,14 @@ jobs:
 
       - name: Dependency security audit
         run: npm audit --audit-level=moderate || true
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Deploy frontend to S3
+        if: github.event_name == 'push'
+        run: aws s3 sync ./dist s3://rentaseat-frontend-2026-038740786269-ap-south-1-an --delete
