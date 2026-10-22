@@ -67,6 +67,7 @@ find "${BUILD_DIR}" -type d -name "__pycache__" | xargs rm -rf 2>/dev/null || tr
 echo "==> Copying Lambda handler & modules..."
 cp "${SCRIPT_DIR}/lambda_function.py" "${BUILD_DIR}/lambda_function.py"
 cp "${SCRIPT_DIR}/auth.py" "${BUILD_DIR}/auth.py"
+cp "${SCRIPT_DIR}/vehicles.py" "${BUILD_DIR}/vehicles.py"
 
 # ── Create deployment zip ────────────────────────────────────────────────────
 echo "==> Creating deployment zip..."

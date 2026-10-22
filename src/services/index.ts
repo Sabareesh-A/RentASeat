@@ -18,7 +18,6 @@ import {
   getJourneysByDriverId,
   getBookingsByPassengerId,
   getUserById,
-  getVehicleById,
   mockUsers,
 } from '../data/mock';
 
@@ -293,27 +292,58 @@ export const bookingService = {
   },
 };
 
+interface VehicleApiResponse {
+  success: boolean;
+  vehicle?: Vehicle;
+  vehicles?: Vehicle[];
+  message?: string;
+  error?: string;
+}
+
 // Vehicle Service
 export const vehicleService = {
-  // Get vehicle by ID
-  async getVehicleById(id: string): Promise<ApiResponse<Vehicle>> {
+  // Get vehicles for the authenticated driver
+  async getVehicles(): Promise<ApiResponse<Vehicle[]>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      const vehicle = getVehicleById(id);
-      if (!vehicle) {
+      const response = await request<VehicleApiResponse>('/vehicles');
+      if (response.success && response.vehicles) {
         return {
-          success: false,
-          error: 'Vehicle not found',
+          success: true,
+          data: response.vehicles,
         };
       }
       return {
-        success: true,
-        data: vehicle,
+        success: false,
+        error: response.error || 'Failed to fetch vehicles',
       };
-    } catch {
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch vehicles';
       return {
         success: false,
-        error: 'Failed to fetch vehicle',
+        error: message,
+      };
+    }
+  },
+
+  // Get vehicle by ID
+  async getVehicleById(id: string): Promise<ApiResponse<Vehicle>> {
+    try {
+      const response = await request<VehicleApiResponse>(`/vehicles/${id}`);
+      if (response.success && response.vehicle) {
+        return {
+          success: true,
+          data: response.vehicle,
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Vehicle not found',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch vehicle';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
@@ -321,21 +351,78 @@ export const vehicleService = {
   // Create vehicle
   async createVehicle(vehicle: Omit<Vehicle, 'id' | 'createdAt'>): Promise<ApiResponse<Vehicle>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const newVehicle: Vehicle = {
-        ...vehicle,
-        id: `vehicle_${Date.now()}`,
-        createdAt: new Date(),
-      };
-      return {
-        success: true,
-        data: newVehicle,
-        message: 'Vehicle created successfully',
-      };
-    } catch {
+      const response = await request<VehicleApiResponse>('/vehicles', {
+        method: 'POST',
+        body: JSON.stringify(vehicle),
+      });
+      if (response.success && response.vehicle) {
+        return {
+          success: true,
+          data: response.vehicle,
+          message: response.message || 'Vehicle created successfully',
+        };
+      }
       return {
         success: false,
-        error: 'Failed to create vehicle',
+        error: response.error || 'Failed to create vehicle',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to create vehicle';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Update vehicle
+  async updateVehicle(id: string, updates: Partial<Vehicle>): Promise<ApiResponse<Vehicle>> {
+    try {
+      const response = await request<VehicleApiResponse>(`/vehicles/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+      if (response.success && response.vehicle) {
+        return {
+          success: true,
+          data: response.vehicle,
+          message: response.message || 'Vehicle updated successfully',
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to update vehicle',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to update vehicle';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Delete vehicle
+  async deleteVehicle(id: string): Promise<ApiResponse<void>> {
+    try {
+      const response = await request<{ success: boolean; message?: string; error?: string }>(`/vehicles/${id}`, {
+        method: 'DELETE',
+      });
+      if (response.success) {
+        return {
+          success: true,
+          message: response.message || 'Vehicle deleted successfully',
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to delete vehicle',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to delete vehicle';
+      return {
+        success: false,
+        error: message,
       };
     }
   },

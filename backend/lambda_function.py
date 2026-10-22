@@ -43,6 +43,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -78,6 +79,10 @@ from auth import (
     validate_registration_role,
     verify_jwt_token,
     verify_password,
+)
+from vehicles import (
+    format_vehicle_row,
+    validate_vehicle_payload,
 )
 
 
@@ -952,17 +957,9 @@ def _handle_get_me(event: dict) -> dict:
     GET /auth/me
     Verify the JWT token and return the authenticated user's profile.
     """
-    headers = event.get("headers", {}) or {}
-    auth_header = headers.get("authorization") or headers.get("Authorization") or ""
-
-    if not auth_header.startswith("Bearer "):
-        return _error_response(401, "Authorization Bearer token required.")
-
-    token = auth_header[7:].strip()
-    try:
-        claims = verify_jwt_token(token)
-    except ValueError as exc:
-        return _error_response(401, f"Authentication failed: {exc}")
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
 
     user_id = claims.get("sub")
     conn = None
@@ -1005,6 +1002,561 @@ def _handle_get_me(event: dict) -> dict:
         return _error_response(503, "Database unavailable.")
     except Exception as exc:
         _log("ERROR", "Unhandled exception in get_me handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ─── Authentication Helpers ─────────────────────────────────────────────────
+
+
+def _extract_auth_claims(event: dict) -> tuple[dict | None, dict | None]:
+    """
+    Extract and cryptographically verify the Bearer JWT token from headers.
+    Returns (claims, None) on success, or (None, error_response) on failure.
+    Validates token signature and expiry without requiring a database connection.
+    """
+    headers = event.get("headers", {}) or {}
+    auth_header = headers.get("authorization") or headers.get("Authorization") or ""
+
+    if not auth_header.startswith("Bearer "):
+        return None, _error_response(401, "Authorization Bearer token required.")
+
+    token = auth_header[7:].strip()
+    try:
+        claims = verify_jwt_token(token)
+    except ValueError as exc:
+        return None, _error_response(401, f"Authentication failed: {exc}")
+
+    if not claims.get("sub"):
+        return None, _error_response(401, "Invalid token subject.")
+
+    return claims, None
+
+
+def _get_authenticated_user(event: dict, cursor) -> tuple[dict | None, dict | None]:
+    """
+    Authenticate the request via Bearer JWT and retrieve live user state from PostgreSQL.
+    Returns (user_dict, None) on success, or (None, error_response) on failure.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return None, auth_err
+
+    user_id = claims["sub"]
+    cursor.execute(
+        """
+        SELECT id, name, email, phone, role, status
+        FROM users
+        WHERE id = %s;
+        """,
+        (user_id,),
+    )
+    row = cursor.fetchone()
+
+    if not row:
+        return None, _error_response(404, "User not found.")
+
+    if row[5] != "active":
+        return None, _error_response(403, "Account is suspended or deactivated.")
+
+    user = {
+        "id": str(row[0]),
+        "name": row[1],
+        "email": row[2],
+        "phone": row[3] or "",
+        "role": row[4],
+        "status": row[5],
+    }
+    return user, None
+
+
+# ─── Vehicle Regex & Handlers ───────────────────────────────────────────────
+
+VEHICLE_PATH_REGEX = re.compile(r"^/vehicles/([a-zA-Z0-9_-]{1,64})$")
+
+
+def _handle_create_vehicle(event: dict) -> dict:
+    """
+    POST /vehicles
+    Register a new vehicle for the authenticated driver (or admin).
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        if user["role"] not in ("driver", "admin"):
+            return _error_response(403, "Driver role required to register vehicles.")
+
+        try:
+            validated = validate_vehicle_payload(body, is_update=False)
+        except ValueError as exc:
+            return _error_response(400, str(exc))
+
+        driver_id = user["id"]
+        # Allow admin to assign vehicle to a specific driver if requested
+        if user["role"] == "admin":
+            specified_driver = body.get("driverId") or body.get("driver_id")
+            if specified_driver:
+                cursor.execute(
+                    "SELECT id, role, status FROM users WHERE id = %s;",
+                    (specified_driver,),
+                )
+                d_row = cursor.fetchone()
+                if not d_row:
+                    return _error_response(404, "Specified driver not found.")
+                if d_row[1] != "driver":
+                    return _error_response(400, "Specified user is not a driver.")
+                driver_id = str(d_row[0])
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO vehicles (driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at;
+                """,
+                (
+                    driver_id,
+                    validated["registration_number"],
+                    validated["vehicle_type"],
+                    validated["model"],
+                    validated["colour"],
+                    validated["seating_capacity"],
+                    validated["image_url"],
+                ),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+        except Exception as insert_exc:
+            conn.rollback()
+            err_msg = str(insert_exc).lower()
+            if "unique" in err_msg or "duplicate" in err_msg or "uq_vehicles_registration" in err_msg:
+                return _error_response(
+                    409,
+                    f"A vehicle with registration number '{validated['registration_number']}' already exists.",
+                )
+            raise
+
+        vehicle_data = format_vehicle_row(row)
+        _log("INFO", "Vehicle created successfully", vehicle_id=vehicle_data["id"], driver_id=driver_id)
+
+        return _response(
+            201,
+            {
+                "success": True,
+                "vehicle": vehicle_data,
+                "message": "Vehicle created successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in create_vehicle handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_list_vehicles(event: dict) -> dict:
+    """
+    GET /vehicles
+    List vehicles for the authenticated driver (or all/filtered for admin).
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        if user["role"] not in ("driver", "admin"):
+            return _error_response(403, "Driver role required to view vehicles.")
+
+        params = event.get("queryStringParameters") or {}
+        target_driver = params.get("driverId") or params.get("driver_id")
+
+        if user["role"] == "admin":
+            if target_driver:
+                cursor.execute(
+                    """
+                    SELECT id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at
+                    FROM vehicles
+                    WHERE driver_id = %s
+                    ORDER BY created_at DESC;
+                    """,
+                    (target_driver,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at
+                    FROM vehicles
+                    ORDER BY created_at DESC;
+                    """
+                )
+        else:
+            cursor.execute(
+                """
+                SELECT id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at
+                FROM vehicles
+                WHERE driver_id = %s
+                ORDER BY created_at DESC;
+                """,
+                (user["id"],),
+            )
+
+        rows = cursor.fetchall()
+        vehicles = [format_vehicle_row(r) for r in rows]
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "vehicles": vehicles,
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in list_vehicles handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_get_vehicle(event: dict, vehicle_id: str) -> dict:
+    """
+    GET /vehicles/{id}
+    Retrieve vehicle by ID, enforcing ownership or admin permission.
+    """
+    if not vehicle_id:
+        return _error_response(400, "Vehicle ID is required.")
+
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        cursor.execute(
+            """
+            SELECT id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at
+            FROM vehicles
+            WHERE id = %s;
+            """,
+            (vehicle_id,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return _error_response(404, "Vehicle not found.")
+
+        # Enforce driver ownership or admin role
+        if str(row[1]) != user["id"] and user["role"] != "admin":
+            return _error_response(403, "You do not have permission to access this vehicle.")
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "vehicle": format_vehicle_row(row),
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in get_vehicle handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_update_vehicle(event: dict, vehicle_id: str) -> dict:
+    """
+    PUT /vehicles/{id} or PATCH /vehicles/{id}
+    Update vehicle fields, enforcing ownership or admin permission and journey capacity constraints.
+    """
+    if not vehicle_id:
+        return _error_response(400, "Vehicle ID is required.")
+
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        try:
+            validated = validate_vehicle_payload(body, is_update=True)
+        except ValueError as exc:
+            return _error_response(400, str(exc))
+
+        if not validated:
+            return _error_response(400, "No valid fields provided to update.")
+
+        cursor.execute(
+            """
+            SELECT id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url
+            FROM vehicles
+            WHERE id = %s;
+            """,
+            (vehicle_id,),
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            return _error_response(404, "Vehicle not found.")
+
+        # Enforce driver ownership or admin role
+        if str(existing[1]) != user["id"] and user["role"] != "admin":
+            return _error_response(403, "You do not have permission to modify this vehicle.")
+
+        # Check journey capacity constraint if seating_capacity is being reduced
+        if "seating_capacity" in validated:
+            new_capacity = validated["seating_capacity"]
+            cursor.execute(
+                """
+                SELECT COALESCE(MAX(total_seats), 0)
+                FROM journeys
+                WHERE vehicle_id = %s AND status = 'active';
+                """,
+                (vehicle_id,),
+            )
+            max_row = cursor.fetchone()
+            max_active_seats = max_row[0] if max_row else 0
+            if new_capacity < max_active_seats:
+                return _error_response(
+                    409,
+                    f"Cannot reduce seating capacity to {new_capacity}. An active journey requires {max_active_seats} seats.",
+                )
+
+        new_reg = validated.get("registration_number", existing[2])
+        new_type = validated.get("vehicle_type", existing[3])
+        new_model = validated.get("model", existing[4])
+        new_colour = validated["colour"] if "colour" in validated else existing[5]
+        new_capacity = validated.get("seating_capacity", existing[6])
+        new_image = validated["image_url"] if "image_url" in validated else existing[7]
+
+        try:
+            cursor.execute(
+                """
+                UPDATE vehicles
+                SET registration_number = %s,
+                    vehicle_type = %s,
+                    model = %s,
+                    colour = %s,
+                    seating_capacity = %s,
+                    image_url = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, driver_id, registration_number, vehicle_type, model, colour, seating_capacity, image_url, created_at, updated_at;
+                """,
+                (new_reg, new_type, new_model, new_colour, new_capacity, new_image, vehicle_id),
+            )
+            updated_row = cursor.fetchone()
+            conn.commit()
+        except Exception as update_exc:
+            conn.rollback()
+            err_msg = str(update_exc).lower()
+            if "unique" in err_msg or "duplicate" in err_msg or "uq_vehicles_registration" in err_msg:
+                return _error_response(
+                    409,
+                    f"A vehicle with registration number '{new_reg}' already exists.",
+                )
+            raise
+
+        vehicle_data = format_vehicle_row(updated_row)
+        _log("INFO", "Vehicle updated successfully", vehicle_id=vehicle_id)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "vehicle": vehicle_data,
+                "message": "Vehicle updated successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in update_vehicle handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_delete_vehicle(event: dict, vehicle_id: str) -> dict:
+    """
+    DELETE /vehicles/{id}
+    Delete a vehicle only if it has no associated journeys.
+    Enforces ownership or admin permission.
+    """
+    if not vehicle_id:
+        return _error_response(400, "Vehicle ID is required.")
+
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        cursor.execute(
+            """
+            SELECT id, driver_id
+            FROM vehicles
+            WHERE id = %s;
+            """,
+            (vehicle_id,),
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            return _error_response(404, "Vehicle not found.")
+
+        # Enforce driver ownership or admin role
+        if str(existing[1]) != user["id"] and user["role"] != "admin":
+            return _error_response(403, "You do not have permission to delete this vehicle.")
+
+        # Check for existing journeys associated with this vehicle
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM journeys
+            WHERE vehicle_id = %s;
+            """,
+            (vehicle_id,),
+        )
+        count_row = cursor.fetchone()
+        journey_count = count_row[0] if count_row else 0
+
+        if journey_count > 0:
+            return _error_response(
+                409,
+                f"Cannot delete vehicle because it is associated with {journey_count} existing journey(s).",
+            )
+
+        try:
+            cursor.execute("DELETE FROM vehicles WHERE id = %s;", (vehicle_id,))
+            conn.commit()
+        except Exception as del_exc:
+            conn.rollback()
+            err_msg = str(del_exc).lower()
+            if "foreign key" in err_msg or "restrict" in err_msg or "violates" in err_msg:
+                return _error_response(
+                    409,
+                    "Cannot delete vehicle because related database records depend on it.",
+                )
+            raise
+
+        _log("INFO", "Vehicle deleted successfully", vehicle_id=vehicle_id)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "message": "Vehicle deleted successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in delete_vehicle handler", error_type=type(exc).__name__)
         return _error_response(500, "Internal server error.")
     finally:
         if cursor is not None:
@@ -1082,6 +1634,29 @@ def lambda_handler(
 
     if method == "GET" and (clean_path == "/auth/me" or path == "/auth/me"):
         return _handle_get_me(event)
+
+    # ─── Vehicle Routes ─────────────────────────────────────────────
+    if clean_path == "/vehicles" or path == "/vehicles":
+        if method == "POST":
+            return _handle_create_vehicle(event)
+        if method == "GET":
+            return _handle_list_vehicles(event)
+
+    vehicle_match = VEHICLE_PATH_REGEX.match(clean_path) or VEHICLE_PATH_REGEX.match(path)
+    v_id = None
+    if vehicle_match:
+        v_id = vehicle_match.group(1)
+    elif event.get("pathParameters") and "id" in event["pathParameters"]:
+        if clean_path.startswith("/vehicles"):
+            v_id = event["pathParameters"]["id"]
+
+    if v_id:
+        if method == "GET":
+            return _handle_get_vehicle(event, v_id)
+        if method in ("PUT", "PATCH"):
+            return _handle_update_vehicle(event, v_id)
+        if method == "DELETE":
+            return _handle_delete_vehicle(event, v_id)
 
     # ─── Unknown route ──────────────────────────────────────────────
 
