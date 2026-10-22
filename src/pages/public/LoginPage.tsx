@@ -33,13 +33,13 @@ const LoginPage: React.FC = () => {
     setLoading(true);
     try {
       const response = await authService.login(email, password);
-      if (response.success) {
-        localStorage.setItem('user', JSON.stringify(response.data));
-        navigate('/passenger/dashboard');
+      if (response.success && response.data) {
+        const userRole = response.data.role || 'passenger';
+        navigate(`/${userRole}/dashboard`);
       } else {
         setError(response.error || 'Login failed');
       }
-    } catch (err) {
+    } catch {
       setError('An unexpected error occurred');
     } finally {
       setLoading(false);

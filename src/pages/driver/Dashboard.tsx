@@ -10,22 +10,30 @@ const DriverDashboard: React.FC = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadJourneys();
-  }, []);
+    let isMounted = true;
+    const userId = JSON.parse(localStorage.getItem('user') || '{}')?.id || 'user1';
 
-  const loadJourneys = async () => {
-    try {
-      const userId = JSON.parse(localStorage.getItem('user') || '{}')?.id || 'user1';
-      const response = await journeyService.getJourneysByDriver(userId);
-      if (response.success) {
-        setJourneys(response.data || []);
-      }
-    } catch (err) {
-      console.error('Failed to load journeys');
-    } finally {
-      setLoading(false);
-    }
-  };
+    journeyService
+      .getJourneysByDriver(userId)
+      .then((response) => {
+        if (isMounted) {
+          if (response.success) {
+            setJourneys(response.data || []);
+          }
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          console.error('Failed to load journeys');
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   return (
     <div>

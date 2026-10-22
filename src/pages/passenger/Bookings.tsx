@@ -8,22 +8,30 @@ const PassengerBookings: React.FC = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    loadBookings();
-  }, []);
+    let isMounted = true;
+    const userId = JSON.parse(localStorage.getItem('user') || '{}')?.id || 'user2';
 
-  const loadBookings = async () => {
-    try {
-      const userId = JSON.parse(localStorage.getItem('user') || '{}')?.id || 'user2';
-      const response = await bookingService.getBookingsByPassenger(userId);
-      if (response.success) {
-        setBookings(response.data || []);
-      }
-    } catch (err) {
-      console.error('Failed to load bookings');
-    } finally {
-      setLoading(false);
-    }
-  };
+    bookingService
+      .getBookingsByPassenger(userId)
+      .then((response) => {
+        if (isMounted) {
+          if (response.success) {
+            setBookings(response.data || []);
+          }
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          console.error('Failed to load bookings');
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   return (
     <div>

@@ -19,7 +19,7 @@ const AdminDashboard: React.FC = () => {
   });
 
   // API health check state
-  const [healthStatus, setHealthStatus] = useState<HealthStatus>('idle');
+  const [healthStatus, setHealthStatus] = useState<HealthStatus>('loading');
   const [healthData, setHealthData] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [healthCheckedAt, setHealthCheckedAt] = useState<Date | null>(null);
@@ -48,8 +48,34 @@ const AdminDashboard: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    checkHealth();
-  }, [checkHealth]);
+    let isMounted = true;
+
+    getHealth()
+      .then((data) => {
+        if (isMounted) {
+          setHealthData(data);
+          setHealthStatus('ok');
+          setHealthCheckedAt(new Date());
+        }
+      })
+      .catch((err) => {
+        if (isMounted) {
+          if (err instanceof ApiError) {
+            setHealthError(`API error ${err.status}: ${err.message}`);
+          } else if (err instanceof TypeError) {
+            setHealthError(`Network error: ${err.message}`);
+          } else {
+            setHealthError('Unknown error occurred');
+          }
+          setHealthStatus('error');
+          setHealthCheckedAt(new Date());
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // ── Health badge helpers ───────────────────────────────────────────────────
   const healthBadgeVariant = (): 'success' | 'warning' | 'error' | 'info' => {

@@ -30,7 +30,7 @@ const ForgotPasswordPage: React.FC = () => {
       } else {
         setError(response.error || 'Failed to send reset email');
       }
-    } catch (err) {
+    } catch {
       setError('An unexpected error occurred');
     } finally {
       setLoading(false);

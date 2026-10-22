@@ -11,12 +11,10 @@ const JourneyDetailsPage: React.FC = () => {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
-  React.useEffect(() => {
-    loadJourney();
-  }, [id]);
-
-  const loadJourney = async () => {
+  const loadJourney = React.useCallback(async () => {
     if (!id) return;
+    setLoading(true);
+    setError(null);
     try {
       const response = await journeyService.getJourneyById(id);
       if (response.success) {
@@ -24,12 +22,40 @@ const JourneyDetailsPage: React.FC = () => {
       } else {
         setError(response.error || 'Journey not found');
       }
-    } catch (err) {
+    } catch {
       setError('Failed to load journey');
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
+
+  React.useEffect(() => {
+    let isMounted = true;
+    if (!id) return;
+
+    journeyService
+      .getJourneyById(id)
+      .then((response) => {
+        if (isMounted) {
+          if (response.success) {
+            setJourney(response.data);
+          } else {
+            setError(response.error || 'Journey not found');
+          }
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setError('Failed to load journey');
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [id]);
 
   return (
     <div>

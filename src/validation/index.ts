@@ -47,7 +47,7 @@ export const validatePassword = (password: string): PasswordStrength => {
   if (/[0-9]/.test(password)) score++;
   else feedback.push('At least one number');
 
-  if (/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) score++;
+  if (/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) score++;
   else feedback.push('At least one special character');
 
   const strengthMap: Record<number, PasswordStrength['strength']> = {

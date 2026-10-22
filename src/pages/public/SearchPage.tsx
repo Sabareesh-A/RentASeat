@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Navbar } from '../../components/ui';
 import { Button } from '../../components/ui/Button';
 import { Input, Select } from '../../components/ui/Input';
@@ -10,65 +10,105 @@ import type { Journey, SearchParams, JourneyFilterOptions } from '../../types';
 import './SearchPage.css';
 
 const SearchPage: React.FC = () => {
-  const searchParams = new URLSearchParams(window.location.search);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
+
   const [filteredJourneys, setFilteredJourneys] = useState<Journey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [searchData, setSearchData] = useState<SearchParams>({
+  const [searchData, setSearchData] = useState<SearchParams>(() => ({
     from: searchParams.get('from') || '',
     to: searchParams.get('to') || '',
     date: searchParams.get('date') || '',
-    seats: parseInt(searchParams.get('seats') || '1'),
-  });
+    seats: parseInt(searchParams.get('seats') || '1', 10) || 1,
+  }));
+
+  // Sync searchData during render when URL query parameters change (e.g. Back/Forward)
+  const [prevParamsString, setPrevParamsString] = useState(() => searchParams.toString());
+  const currentParamsString = searchParams.toString();
+  if (currentParamsString !== prevParamsString) {
+    setPrevParamsString(currentParamsString);
+    setSearchData({
+      from: searchParams.get('from') || '',
+      to: searchParams.get('to') || '',
+      date: searchParams.get('date') || '',
+      seats: parseInt(searchParams.get('seats') || '1', 10) || 1,
+    });
+  }
 
   const [_filters, _setFilters] = useState<JourneyFilterOptions>({});
   const [sortBy, setSortBy] = useState<'price' | 'time' | 'rating'>('price');
 
-  useEffect(() => {
-    loadJourneys();
-  }, [searchData]);
+  const applySorting = useCallback(
+    (data: Journey[]) => {
+      const sorted = [...data];
+      if (sortBy === 'price') {
+        sorted.sort((a, b) => a.pricePerSeat - b.pricePerSeat);
+      } else if (sortBy === 'time') {
+        sorted.sort((a, b) => a.departureTime.localeCompare(b.departureTime));
+      } else if (sortBy === 'rating') {
+        sorted.sort((a, b) => (b.driver.rating || 0) - (a.driver.rating || 0));
+      }
+      return sorted;
+    },
+    [sortBy]
+  );
 
-  const loadJourneys = async () => {
+  const loadJourneys = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const response = await journeyService.searchJourneys(searchData);
       if (response.success && response.data) {
         const journeyData = response.data;
-        let results = applySorting(journeyData);
+        const results = applySorting(journeyData);
         setFilteredJourneys(results);
       } else {
         setError(response.error || 'Failed to load journeys');
       }
-    } catch (err) {
+    } catch {
       setError('An unexpected error occurred');
     } finally {
       setLoading(false);
     }
-  };
+  }, [searchData, applySorting]);
 
-  const applySorting = (data: Journey[]) => {
-    const sorted = [...data];
-    if (sortBy === 'price') {
-      sorted.sort((a, b) => a.pricePerSeat - b.pricePerSeat);
-    } else if (sortBy === 'time') {
-      sorted.sort((a, b) => a.departureTime.localeCompare(b.departureTime));
-    } else if (sortBy === 'rating') {
-      sorted.sort((a, b) => (b.driver.rating || 0) - (a.driver.rating || 0));
-    }
-    return sorted;
-  };
+  useEffect(() => {
+    let isMounted = true;
+
+    journeyService
+      .searchJourneys(searchData)
+      .then((response) => {
+        if (isMounted) {
+          if (response.success && response.data) {
+            setFilteredJourneys(applySorting(response.data));
+          } else {
+            setError(response.error || 'Failed to load journeys');
+          }
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setError('An unexpected error occurred');
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [searchData, applySorting]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    const params = new URLSearchParams({
+    setSearchParams({
       from: searchData.from,
       to: searchData.to,
       date: searchData.date,
       seats: searchData.seats.toString(),
     });
-    window.location.href = `/search?${params.toString()}`;
   };
 
   return (
@@ -185,7 +225,7 @@ const SearchPage: React.FC = () => {
                   key={journey.id}
                   journey={journey}
                   onViewDetails={() => {
-                    window.location.href = `/journey/${journey.id}`;
+                    navigate(`/journey/${journey.id}`);
                   }}
                   onBook={() => {
                     // Handle booking

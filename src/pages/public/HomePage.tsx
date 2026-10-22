@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Navbar, Footer } from '../../components/ui';
 import { Button } from '../../components/ui/Button';
 import { Input, Select } from '../../components/ui/Input';
 import './HomePage.css';
 
 const HomePage: React.FC = () => {
+  const navigate = useNavigate();
   const [searchData, setSearchData] = useState({
     from: '',
     to: '',
@@ -15,8 +16,13 @@ const HomePage: React.FC = () => {
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    // Navigate to search page
-    window.location.href = `/search?from=${searchData.from}&to=${searchData.to}&date=${searchData.date}&seats=${searchData.seats}`;
+    const params = new URLSearchParams({
+      from: searchData.from,
+      to: searchData.to,
+      date: searchData.date,
+      seats: searchData.seats,
+    });
+    navigate(`/search?${params.toString()}`);
   };
 
   return (

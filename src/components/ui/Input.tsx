@@ -19,7 +19,8 @@ export const Input: React.FC<InputProps> = ({
   id,
   ...props
 }) => {
-  const inputId = id || `input-${Math.random().toString(36).substr(2, 9)}`;
+  const generatedId = React.useId();
+  const inputId = id || `input-${generatedId}`;
 
   return (
     <div className={`input-container ${containerClassName || ''}`}>
@@ -60,7 +61,8 @@ export const Textarea: React.FC<TextareaProps> = ({
   id,
   ...props
 }) => {
-  const textareaId = id || `textarea-${Math.random().toString(36).substr(2, 9)}`;
+  const generatedId = React.useId();
+  const textareaId = id || `textarea-${generatedId}`;
 
   return (
     <div className={`input-container ${containerClassName || ''}`}>
@@ -98,7 +100,8 @@ export const Select: React.FC<SelectProps> = ({
   id,
   ...props
 }) => {
-  const selectId = id || `select-${Math.random().toString(36).substr(2, 9)}`;
+  const generatedId = React.useId();
+  const selectId = id || `select-${generatedId}`;
 
   return (
     <div className={`input-container ${containerClassName || ''}`}>
@@ -139,7 +142,8 @@ export const Checkbox: React.FC<CheckboxProps> = ({
   id,
   ...props
 }) => {
-  const checkboxId = id || `checkbox-${Math.random().toString(36).substr(2, 9)}`;
+  const generatedId = React.useId();
+  const checkboxId = id || `checkbox-${generatedId}`;
 
   return (
     <div className={`checkbox-container ${containerClassName || ''}`}>

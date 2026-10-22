@@ -63,9 +63,10 @@ echo "==> Installing dependencies into package/..."
 echo "==> Stripping __pycache__..."
 find "${BUILD_DIR}" -type d -name "__pycache__" | xargs rm -rf 2>/dev/null || true
 
-# ── Copy Lambda handler ──────────────────────────────────────────────────────
-echo "==> Copying Lambda handler..."
+# ── Copy Lambda handler & modules ───────────────────────────────────────────
+echo "==> Copying Lambda handler & modules..."
 cp "${SCRIPT_DIR}/lambda_function.py" "${BUILD_DIR}/lambda_function.py"
+cp "${SCRIPT_DIR}/auth.py" "${BUILD_DIR}/auth.py"
 
 # ── Create deployment zip ────────────────────────────────────────────────────
 echo "==> Creating deployment zip..."

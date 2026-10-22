@@ -1,43 +1,89 @@
 """
-RentASeat Lambda handler — Step 2A: Health + DB connectivity proof.
+RentASeat Lambda handler — Step 3: Health + Authentication (Register/Login/Me).
 
 Routes handled:
-  GET /health     — basic liveness check (unchanged from original)
-  GET /db-health  — proves Lambda → RDS connectivity
+
+  GET /health         — basic liveness check
+  GET /db-health      — proves Lambda → RDS connectivity
+  POST /auth/register — register new passenger/driver with password hashing & JWT
+  POST /auth/login    — authenticate user & issue JWT
+  GET /auth/me        — verify session & return current user profile
 
 Credential resolution order (see _get_db_credentials):
-  1. AWS Secrets Manager via DB_SECRET_ARN  (preferred, requires VPC endpoint
-     or NAT — see DEPLOYMENT_NOTES.md)
-  2. DB_PASSWORD environment variable        (temporary dev fallback only)
+
+  1. DB_PASSWORD environment variable
+     Temporary development fallback.
+     Used while Lambda is inside a VPC without a Secrets Manager
+     VPC endpoint or NAT Gateway.
+
+  2. AWS Secrets Manager via DB_SECRET_ARN
+     Production path.
+     Requires a Secrets Manager VPC Interface Endpoint or NAT Gateway.
 
 Security properties enforced in this file:
+
   - Passwords, secret values, and connection strings are NEVER logged or
     returned in API responses under any code path.
-  - All SQL uses DB-API parameterised execution — no string interpolation
-    with any external input.
+  - Constant-time password verification via hashlib.scrypt and hmac.compare_digest.
+  - Public registration rejects privilege escalation (e.g. self-assigning 'admin').
+  - Generic authentication errors to prevent account enumeration.
+  - All SQL uses DB-API parameterised execution (%s) — no string concatenation.
   - Errors are caught and sanitised before being returned to callers.
+  - Payload size limits enforced on incoming request bodies (<= 64 KB).
   - Structured JSON logging includes request IDs for CloudWatch tracing.
-  - del is called on references to the raw secret immediately after use.
-    Note: del removes the Python name binding; CPython may not immediately
-    release the underlying memory. This reduces the reachability window but
-    is not a cryptographic memory wipe.
 
-NOT implemented here (reserved for later steps):
-  POST /auth/register, POST /auth/login, JWT, RBAC, booking/journey APIs.
+NOT implemented here (reserved for Step 4):
+
+  booking APIs
+  journey APIs
 """
 
+
+import base64
 import json
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:
+    boto3 = None
+    BotoCoreError = Exception  # type: ignore
+    ClientError = Exception    # type: ignore
 
-import pg8000.dbapi as pg8000_dbapi
+# Ensure local modules (auth.py) and local dependencies (backend/package) resolve
+_cur_dir = str(Path(__file__).resolve().parent)
+_pkg_dir = str(Path(__file__).resolve().parent / "package")
+for _p in (_cur_dir, _pkg_dir):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    import pg8000.dbapi as pg8000_dbapi
+except ImportError:
+    pg8000_dbapi = None
+
+from auth import (
+    create_jwt_token,
+    hash_password,
+    validate_email,
+    validate_name,
+    validate_password_input,
+    validate_phone,
+    validate_registration_role,
+    verify_jwt_token,
+    verify_password,
+)
+
 
 # ─── Logging ────────────────────────────────────────────────────────────────
-# Structured JSON so CloudWatch Logs Insights can filter/query individual fields.
+
+# Structured JSON so CloudWatch Logs Insights can filter/query
+# individual fields.
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -46,11 +92,19 @@ def _log(level: str, message: str, **extra) -> None:
     """
     Emit a single-line JSON log entry.
 
-    SECURITY: Never pass passwords, tokens, secret values, or connection
-    strings as keyword arguments to this function.
+    SECURITY:
+    Never pass passwords, tokens, secret values, or connection strings
+    as keyword arguments to this function.
     """
-    entry = {"level": level, "message": message, **extra}
+
+    entry = {
+        "level": level,
+        "message": message,
+        **extra,
+    }
+
     line = json.dumps(entry, default=str)
+
     if level == "ERROR":
         logger.error(line)
     elif level == "WARNING":
@@ -59,350 +113,977 @@ def _log(level: str, message: str, **extra) -> None:
         logger.info(line)
 
 
-# ─── Environment variables ───────────────────────────────────────────────────
-# All sourced from Lambda environment configuration — never hardcoded here.
-# DB_PASSWORD is intentionally not read at module level; it is read inside
-# _get_db_credentials() only when needed, so it is never accidentally logged
-# as part of module-level initialisation output.
+# ─── Environment variables ─────────────────────────────────────────────────
+
+# All sourced from Lambda environment configuration.
+# Nothing sensitive is hardcoded in this file.
+
 DB_HOST = os.environ.get("DB_HOST", "")
 DB_PORT = int(os.environ.get("DB_PORT", "5432"))
 DB_NAME = os.environ.get("DB_NAME", "postgres")
 DB_SECRET_ARN = os.environ.get("DB_SECRET_ARN", "")
 
-# AWS region is always set by the Lambda runtime.
+# AWS region is provided by the Lambda runtime.
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 
 
-# ─── Secrets Manager client ──────────────────────────────────────────────────
-# Created at module level so it is reused across warm invocations.
-# Uses the Lambda execution role credentials automatically — no access keys.
-_secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+# ─── Secrets Manager client ────────────────────────────────────────────────
 
-# Module-level credential cache: populated on first invocation, reused on
-# subsequent warm starts to avoid repeated Secrets Manager round-trips.
-# Lambda execution environments are single-threaded (one invocation at a
-# time per environment), so there is no race condition on this variable.
-# The cache stores only username + password, never the raw secret string.
+# Created at module level so it can be reused across warm invocations.
+# Uses the Lambda execution role credentials automatically.
+# No AWS access keys are stored in the code.
+
+_secrets_client = (
+    boto3.client(
+        "secretsmanager",
+        region_name=AWS_REGION,
+    )
+    if boto3 is not None
+    else None
+)
+
+
+# Module-level credential cache.
+#
+# Populated on first successful credential resolution and reused during
+# subsequent warm Lambda invocations.
+#
+# The cache stores only username + password and never the raw JSON secret.
+
 _db_credentials: dict | None = None
 
 
-# ─── Credential resolution ───────────────────────────────────────────────────
+# ─── Credential resolution ─────────────────────────────────────────────────
+
 
 def _credentials_from_secrets_manager() -> dict:
     """
-    Attempt to retrieve credentials from AWS Secrets Manager.
+    Retrieve database credentials from AWS Secrets Manager.
 
     Requires one of:
-      - A Secrets Manager VPC Interface Endpoint in the Lambda's VPC, OR
-      - A NAT Gateway with internet access
 
-    Returns a dict with 'username' and 'password'.
-    Raises RuntimeError with a safe message on any failure.
+      - A Secrets Manager VPC Interface Endpoint in the Lambda VPC, OR
+      - A NAT Gateway with internet access.
+
+    Returns:
+        dict containing 'username' and 'password'.
+
+    Raises:
+        RuntimeError with a safe message on failure.
     """
-    _log("INFO", "Retrieving credentials from Secrets Manager",
-         # Log only the tail of the ARN for traceability — never the full ARN
-         # as it may be considered sensitive configuration data.
-         arn_tail=DB_SECRET_ARN[-12:] if len(DB_SECRET_ARN) >= 12 else "short-arn")
+
+    _log(
+        "INFO",
+        "Retrieving credentials from Secrets Manager",
+        # Log only the tail of the ARN for traceability.
+        # Never log the complete ARN.
+        arn_tail=(
+            DB_SECRET_ARN[-12:]
+            if len(DB_SECRET_ARN) >= 12
+            else "short-arn"
+        ),
+    )
+
+    if _secrets_client is None:
+        raise RuntimeError("Secrets Manager client is not initialized.")
 
     try:
-        response = _secrets_client.get_secret_value(SecretId=DB_SECRET_ARN)
+        response = _secrets_client.get_secret_value(
+            SecretId=DB_SECRET_ARN
+        )
+
     except ClientError as exc:
         error_code = exc.response["Error"]["Code"]
-        # Log the AWS error code (safe) — not the full exception message
-        # which may contain ARN or account details.
-        _log("ERROR", "Secrets Manager ClientError", error_code=error_code)
-        raise RuntimeError(f"Secrets Manager error: {error_code}") from None
+
+        # Log only the AWS error code.
+        # Do not log the complete exception because it may contain
+        # sensitive configuration information.
+        _log(
+            "ERROR",
+            "Secrets Manager ClientError",
+            error_code=error_code,
+        )
+
+        raise RuntimeError(
+            f"Secrets Manager error: {error_code}"
+        ) from None
+
     except BotoCoreError as exc:
-        # BotoCoreError on a VPC-attached Lambda typically means the Lambda
-        # cannot reach the Secrets Manager endpoint. A VPC Interface Endpoint
-        # (com.amazonaws.ap-south-1.secretsmanager) would resolve this.
-        _log("ERROR", "Secrets Manager network error — VPC endpoint may be required",
-             error_type=type(exc).__name__)
-        raise RuntimeError("Secrets Manager unreachable from this VPC.") from None
+
+        # A VPC-attached Lambda may reach this path when it cannot
+        # reach the Secrets Manager endpoint.
+        #
+        # A VPC Interface Endpoint for:
+        #
+        # com.amazonaws.ap-south-1.secretsmanager
+        #
+        # or NAT Gateway connectivity would resolve this.
+
+        _log(
+            "ERROR",
+            "Secrets Manager network error — "
+            "VPC endpoint may be required",
+            error_type=type(exc).__name__,
+        )
+
+        raise RuntimeError(
+            "Secrets Manager unreachable from this VPC."
+        ) from None
 
     raw_secret = response.get("SecretString", "")
+
     if not raw_secret:
-        raise RuntimeError("Secrets Manager returned an empty secret value.")
+        raise RuntimeError(
+            "Secrets Manager returned an empty secret value."
+        )
 
     try:
         secret_dict = json.loads(raw_secret)
+
     except json.JSONDecodeError:
-        raise RuntimeError("Secrets Manager secret is not valid JSON.") from None
+        raise RuntimeError(
+            "Secrets Manager secret is not valid JSON."
+        ) from None
+
     finally:
         # Remove the name binding immediately after parsing.
-        # Note: this reduces the reference lifetime; it is not a memory wipe.
+        #
+        # This is not a cryptographic memory wipe.
         del raw_secret
 
-    username = secret_dict.get("username") or secret_dict.get("user")
+    username = (
+        secret_dict.get("username")
+        or secret_dict.get("user")
+    )
+
     password = secret_dict.get("password")
 
     if not username or not password:
         raise RuntimeError(
-            "Secrets Manager secret is missing 'username' or 'password' fields."
+            "Secrets Manager secret is missing "
+            "'username' or 'password' fields."
         )
 
-    result = {"username": username, "password": password}
-    del secret_dict  # Remove reference to the full secret dict
-    _log("INFO", "Credentials retrieved from Secrets Manager")
+    result = {
+        "username": username,
+        "password": password,
+    }
+
+    # Remove reference to the complete secret dictionary.
+    del secret_dict
+
+    _log(
+        "INFO",
+        "Credentials retrieved from Secrets Manager",
+    )
+
     return result
 
 
 def _credentials_from_env() -> dict:
     """
-    Temporary development fallback: read DB credentials from Lambda
-    environment variables.
+    Temporary development fallback.
+
+    Read database credentials from Lambda environment variables.
 
     SECURITY TRADEOFF:
-      - DB_PASSWORD is set directly in the Lambda console (not in source code,
-        not in .env files, not in deployment scripts, not in git).
-      - It is visible to anyone with Lambda:GetFunctionConfiguration IAM
-        permission — treat access to that permission as highly sensitive.
-      - Lambda encrypts environment variables at rest using the account's
-        default KMS key.
-      - This approach does NOT support automatic credential rotation.
-      - This is acceptable ONLY for temporary development use on a private
-        student project with no real user data.
-      - Replace with Secrets Manager before any real user data is stored.
 
-    Raises RuntimeError if DB_PASSWORD is not set or empty.
+      - DB_PASSWORD is configured directly in Lambda environment
+        variables.
+
+      - It is NOT stored in source code.
+
+      - It is NOT stored in .env files.
+
+      - It is NOT stored in deployment scripts.
+
+      - It is visible to identities with permission to retrieve
+        Lambda environment configuration.
+
+      - Lambda encrypts environment variables at rest.
+
+      - This approach does NOT provide automatic credential rotation.
+
+      - This is acceptable ONLY for temporary development on a private
+        student project with no real user data.
+
+      - Replace this with Secrets Manager before production use.
+
+    Raises:
+        RuntimeError if DB_PASSWORD is missing.
     """
-    # DB_PASSWORD is read here, not at module level, to avoid it being
-    # captured in any initialisation logging.
-    db_password = os.environ.get("DB_PASSWORD", "")
-    db_username = os.environ.get("DB_USERNAME", "rentaseat_admin")
+
+    # DB_PASSWORD is intentionally read here rather than at module level.
+    # This prevents accidental exposure during module initialisation.
+
+    db_password = os.environ.get(
+        "DB_PASSWORD",
+        "",
+    )
+
+    db_username = os.environ.get(
+        "DB_USERNAME",
+        "rentaseat_admin",
+    )
 
     if not db_password:
         raise RuntimeError(
             "DB_PASSWORD environment variable is not set. "
-            "Set it in the Lambda console (Configuration → Environment variables). "
+            "Set it in the Lambda console under "
+            "Configuration → Environment variables. "
             "Do NOT add it to source code or deployment scripts."
         )
 
-    _log("INFO", "Using DB_PASSWORD environment variable (temporary dev fallback)")
-    return {"username": db_username, "password": db_password}
+    _log(
+        "INFO",
+        "Using DB_PASSWORD environment variable "
+        "(temporary dev fallback)",
+    )
+
+    return {
+        "username": db_username,
+        "password": db_password,
+    }
 
 
 def _get_db_credentials() -> dict:
     """
-    Resolve database credentials using the following priority:
+    Resolve database credentials.
 
-      1. AWS Secrets Manager (preferred — uses DB_SECRET_ARN)
-         Requires network access from Lambda VPC to Secrets Manager endpoint.
+    Current development priority:
 
-      2. DB_PASSWORD environment variable (temporary development fallback)
-         Used when Secrets Manager is unreachable due to missing VPC endpoint.
-         See DEPLOYMENT_NOTES.md for the full security tradeoff.
+      1. DB_PASSWORD environment variable
+         Temporary development path.
 
-    Returns a dict with 'username' and 'password'.
-    Raises RuntimeError if neither source can provide credentials.
+      2. AWS Secrets Manager via DB_SECRET_ARN
+         Production path when DB_PASSWORD is not configured.
 
-    Results are cached at module level for warm Lambda invocations.
+    DB_PASSWORD currently takes priority because the Lambda is inside
+    a private VPC without a Secrets Manager VPC endpoint or NAT Gateway.
+
+    Returns:
+        dict containing 'username' and 'password'.
+
+    Raises:
+        RuntimeError if neither credential source is available.
+
+    Credentials are cached for warm Lambda invocations.
     """
+
     global _db_credentials
+
+    # Reuse credentials already resolved during this warm invocation
+    # environment.
 
     if _db_credentials is not None:
         return _db_credentials
 
-    # Temporary development path: prefer DB_PASSWORD when it is configured.
-    # This avoids requiring network access from the VPC to Secrets Manager.
+    # ─── Temporary development path ────────────────────────────────
+    #
+    # DB_PASSWORD avoids requiring network access from the Lambda VPC
+    # to Secrets Manager.
+
     if os.environ.get("DB_PASSWORD", ""):
+
         _db_credentials = _credentials_from_env()
+
         return _db_credentials
 
-    # Production path: use Secrets Manager when DB_PASSWORD is not configured.
+    # ─── Production path ────────────────────────────────────────────
+    #
+    # Used when DB_PASSWORD is not configured.
+
     if DB_SECRET_ARN:
+
         _db_credentials = _credentials_from_secrets_manager()
+
         return _db_credentials
+
+    # No DB_PASSWORD and no usable Secrets Manager configuration.
 
     _db_credentials = _credentials_from_env()
+
     return _db_credentials
 
 
-# ─── Database connectivity ───────────────────────────────────────────────────
+# ─── Database connectivity ─────────────────────────────────────────────────
+
 
 def _get_db_connection():
     """
-    Open a new pg8000 DB-API connection to the private RDS PostgreSQL instance.
+    Open a new pg8000 DB-API connection to the private RDS PostgreSQL
+    instance.
 
-    SSL is enabled for this connection (ssl_context=True). This means pg8000
-    will require SSL and fail if the server does not support it. RDS PostgreSQL
-    supports SSL on all configurations; rds.force_ssl is not required for SSL
-    to work, only for enforcing it server-side.
+    SSL is enabled for this connection using ssl_context=True.
 
-    The connection is not pooled — Lambda invocations are short-lived and
-    connection pooling adds complexity without meaningful benefit at this scale.
+    RDS PostgreSQL supports SSL. Server-side SSL enforcement is separate
+    and can be enabled with the rds.force_ssl parameter.
+
+    The connection is not pooled.
+
+    At this development scale, Lambda invocations are short-lived and
+    connection pooling would add unnecessary complexity.
+
     The caller is responsible for closing the connection in a finally block.
     """
+
     creds = _get_db_credentials()
 
     if not DB_HOST:
-        raise RuntimeError("DB_HOST environment variable is not set.")
+        raise RuntimeError(
+            "DB_HOST environment variable is not set."
+        )
 
-    _log("INFO", "Opening database connection",
-         host=DB_HOST, port=DB_PORT, database=DB_NAME)
+    _log(
+        "INFO",
+        "Opening database connection",
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+    )
+
+    if pg8000_dbapi is None:
+        raise RuntimeError("Database driver (pg8000) is not available.")
 
     try:
         conn = pg8000_dbapi.connect(
             user=creds["username"],
-            password=creds["password"],   # never logged
+            password=creds["password"],  # Never logged.
             host=DB_HOST,
             port=DB_PORT,
             database=DB_NAME,
-            ssl_context=True,             # require SSL; uses Python ssl defaults
-            timeout=5,                    # seconds — fail fast, don't hang Lambda
-            application_name="RentASeat-Lambda",  # visible in pg_stat_activity
+
+            # Require SSL for the PostgreSQL connection.
+            ssl_context=True,
+
+            # Fail quickly rather than allowing a connection attempt
+            # to consume the entire Lambda timeout.
+            timeout=5,
+
+            # Helps identify application connections in PostgreSQL.
+            application_name="RentASeat-Lambda",
         )
+
         return conn
 
-    except pg8000_dbapi.InterfaceError as exc:
-        # InterfaceError covers network errors, SSL failures, and auth failures.
-        # Do not include exc details — may contain host/port/auth information.
-        _log("ERROR", "PostgreSQL connection failed (InterfaceError)",
-             host=DB_HOST, port=DB_PORT, database=DB_NAME)
-        raise RuntimeError("Database connection failed.") from None
+    except pg8000_dbapi.InterfaceError:
 
-    except pg8000_dbapi.OperationalError as exc:
-        _log("ERROR", "PostgreSQL connection failed (OperationalError)",
-             host=DB_HOST, port=DB_PORT, database=DB_NAME)
-        raise RuntimeError("Database connection failed.") from None
+        _log(
+            "ERROR",
+            "PostgreSQL connection failed (InterfaceError)",
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+        )
+
+        raise RuntimeError(
+            "Database connection failed."
+        ) from None
+
+    except pg8000_dbapi.OperationalError:
+
+        _log(
+            "ERROR",
+            "PostgreSQL connection failed (OperationalError)",
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+        )
+
+        raise RuntimeError(
+            "Database connection failed."
+        ) from None
 
     except Exception as exc:
-        _log("ERROR", "Unexpected error opening database connection",
-             error_type=type(exc).__name__)
-        raise RuntimeError("Unexpected error connecting to the database.") from None
+
+        _log(
+            "ERROR",
+            "Unexpected error opening database connection",
+            error_type=type(exc).__name__,
+        )
+
+        raise RuntimeError(
+            "Unexpected error connecting to the database."
+        ) from None
 
 
-# ─── Response helpers ────────────────────────────────────────────────────────
+# ─── Response helpers ──────────────────────────────────────────────────────
+
 
 def _response(status_code: int, body: dict) -> dict:
-    """Build a Lambda proxy integration response with safe default headers."""
+    """
+    Build a Lambda proxy integration response with safe default headers.
+    """
+
     return {
         "statusCode": status_code,
+
         "headers": {
             "Content-Type": "application/json",
+
+            # Prevent MIME-type sniffing.
             "X-Content-Type-Options": "nosniff",
-            # Prevent caching of API responses at any layer.
+
+            # Prevent caching of API responses.
             "Cache-Control": "no-store",
         },
+
         "body": json.dumps(body),
     }
 
 
-def _error_response(status_code: int, message: str) -> dict:
+def _error_response(
+    status_code: int,
+    message: str,
+) -> dict:
     """
     Return a sanitised error response.
 
-    Only pre-vetted, safe message strings should be passed here.
-    Never pass raw exception messages, stack traces, or database error details.
+    Only pre-vetted safe message strings should be passed here.
+
+    Never return raw exception messages, stack traces, database errors,
+    passwords, tokens, or other sensitive information.
     """
-    return _response(status_code, {"error": message})
+
+    return _response(
+        status_code,
+        {
+            "error": message,
+        },
+    )
 
 
-# ─── Route handlers ──────────────────────────────────────────────────────────
+# ─── Health handler ─────────────────────────────────────────────────────────
+
 
 def _handle_health() -> dict:
     """
-    GET /health — basic liveness probe.
+    GET /health
 
-    Returns the same response shape as the original Lambda implementation
-    so existing frontend health-check code and tests continue to work.
+    Basic application liveness check.
+
+    Does not access the database.
     """
-    return _response(200, {
-        "status": "ok",
-        "service": "RentASeat-API",
-        "message": "RentASeat backend is running",
-    })
+
+    return _response(
+        200,
+        {
+            "status": "ok",
+            "service": "RentASeat-API",
+            "message": "RentASeat backend is running",
+        },
+    )
+
+
+# ─── Database health handler ────────────────────────────────────────────────
 
 
 def _handle_db_health() -> dict:
     """
-    GET /db-health — temporary endpoint to prove Lambda → RDS connectivity.
+    GET /db-health
 
-    Executes SELECT 1 via a parameterised query to confirm the full path:
-    Lambda credentials → pg8000 → TCP/SSL → RDS PostgreSQL → response.
+    Temporary endpoint used to prove:
 
-    Returns only a safe status summary. Never returns credentials, connection
-    strings, version strings, schema details, or error internals.
+        Lambda
+          ↓
+        VPC
+          ↓
+        Security Group
+          ↓
+        RDS PostgreSQL
+          ↓
+        SQL query execution
 
-    IMPORTANT: This endpoint should be removed or access-restricted before
-    production. It exposes database reachability status publicly.
+    Executes a simple SELECT 1 query.
+
+    The query contains no external input, so SQL injection is not possible
+    through this endpoint.
+
+    The result value itself is not used as the success criterion.
+
+    Successful execution and fetch are sufficient to prove database
+    connectivity.
     """
-    _log("INFO", "DB health check requested")
+
+    _log(
+        "INFO",
+        "DB health check requested",
+    )
+
     start = time.monotonic()
+
     conn = None
+    cursor = None
 
     try:
+
+        # Open connection to private RDS PostgreSQL.
         conn = _get_db_connection()
+
+        # Create a cursor.
         cursor = conn.cursor()
 
-        # DB-API parameterised execution — pg8000 sends the value via the
-        # PostgreSQL extended query protocol, never interpolated into SQL text.
-        cursor.execute("SELECT %s", (1,))
-        row = cursor.fetchone()
-        cursor.close()
+        # Constant query.
+        #
+        # No user-controlled data is included.
+        cursor.execute("SELECT 1")
 
-        elapsed_ms = round((time.monotonic() - start) * 1000)
+        # Fetch the result to ensure the query completed successfully.
+        cursor.fetchone()
 
-        if row is not None and row[0] == 1:
-            _log("INFO", "Database connectivity confirmed", elapsed_ms=elapsed_ms)
-            return _response(200, {
+        elapsed_ms = round(
+            (time.monotonic() - start) * 1000
+        )
+
+        _log(
+            "INFO",
+            "Database connectivity confirmed",
+            elapsed_ms=elapsed_ms,
+        )
+
+        return _response(
+            200,
+            {
                 "status": "ok",
                 "database": "connected",
                 "latency_ms": elapsed_ms,
-            })
+            },
+        )
 
-        _log("ERROR", "Database query returned unexpected result",
-             elapsed_ms=elapsed_ms)
-        return _error_response(500, "Database returned unexpected result.")
+    except RuntimeError:
 
-    except RuntimeError as exc:
-        # RuntimeError messages from _get_db_credentials / _get_db_connection
-        # have already been sanitised by those functions — safe to surface.
-        elapsed_ms = round((time.monotonic() - start) * 1000)
-        _log("ERROR", "DB health check failed", elapsed_ms=elapsed_ms,
-             reason=str(exc))
-        return _error_response(503, f"Database unavailable: {exc}")
+        elapsed_ms = round(
+            (time.monotonic() - start) * 1000
+        )
+
+        _log(
+            "ERROR",
+            "DB health check failed",
+            elapsed_ms=elapsed_ms,
+        )
+
+        return _error_response(
+            503,
+            "Database unavailable.",
+        )
 
     except Exception as exc:
-        elapsed_ms = round((time.monotonic() - start) * 1000)
-        _log("ERROR", "Unhandled exception in db-health handler",
-             error_type=type(exc).__name__, elapsed_ms=elapsed_ms)
-        return _error_response(500, "Internal server error.")
+
+        elapsed_ms = round(
+            (time.monotonic() - start) * 1000
+        )
+
+        _log(
+            "ERROR",
+            "Unhandled exception in db-health handler",
+            error_type=type(exc).__name__,
+            elapsed_ms=elapsed_ms,
+        )
+
+        return _error_response(
+            500,
+            "Internal server error.",
+        )
 
     finally:
-        # Always attempt to close the connection, even if an exception occurred.
-        # Each Lambda invocation opens and closes its own connection — there is
-        # no persistent pool at this stage.
+
+        # Always close the cursor.
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+        # Always close the database connection.
         if conn is not None:
             try:
                 conn.close()
             except Exception:
-                pass  # Best-effort; do not mask the original error
+                pass
 
 
-# ─── Main handler ────────────────────────────────────────────────────────────
+# ─── Request Body Helper ────────────────────────────────────────────────────
 
-def lambda_handler(event: dict, context) -> dict:
+
+def _parse_body(event: dict) -> dict:
+    """
+    Parse and validate incoming JSON request body.
+    Enforces payload size limit of 64 KB (65,536 bytes).
+    Handles base64-encoded bodies from API Gateway.
+    """
+    body_raw = event.get("body", "")
+
+    if not body_raw:
+        raise ValueError("Request body is empty.")
+
+    # Protect against oversized payloads
+    if len(body_raw) > 65536:
+        raise ValueError("Request payload exceeds 64 KB limit.")
+
+    if event.get("isBase64Encoded", False):
+        try:
+            body_bytes = base64.b64decode(body_raw)
+            body_text = body_bytes.decode("utf-8")
+        except Exception:
+            raise ValueError("Malformed base64 request body.")
+    else:
+        body_text = body_raw
+
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        raise ValueError("Malformed JSON request body.")
+
+    if not isinstance(data, dict):
+        raise ValueError("JSON request body must be an object.")
+
+    return data
+
+
+# ─── Authentication Handlers ────────────────────────────────────────────────
+
+
+def _handle_register(event: dict) -> dict:
+    """
+    POST /auth/register
+    Register a new user (passenger or driver).
+    Enforces server-side validation and scrypt password hashing.
+    Generates and returns an initial JWT token.
+    """
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    try:
+        name = validate_name(body.get("name"))
+        email = validate_email(body.get("email"))
+        password = validate_password_input(body.get("password"))
+        role = validate_registration_role(body.get("role"))
+        phone = validate_phone(body.get("phone"))
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        # Check for existing email (case-insensitive lookup)
+        cursor.execute("SELECT id FROM users WHERE email = %s;", (email,))
+        if cursor.fetchone():
+            return _error_response(409, "An account with this email already exists.")
+
+        # Hash password using scrypt
+        pw_hash = hash_password(password)
+
+        cursor.execute(
+            """
+            INSERT INTO users (name, email, password_hash, phone, role, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+            RETURNING id, name, email, phone, role, status, avatar_url, rating, review_count, created_at;
+            """,
+            (name, email, pw_hash, phone, role),
+        )
+        row = cursor.fetchone()
+        conn.commit()
+
+        user_id = str(row[0])
+        token = create_jwt_token(user_id=user_id, email=row[2], role=row[4])
+
+        user_data = {
+            "id": user_id,
+            "name": row[1],
+            "email": row[2],
+            "phone": row[3] or "",
+            "role": row[4],
+            "status": row[5],
+            "avatar": row[6] or "",
+            "rating": float(row[7]) if row[7] is not None else 5.0,
+            "reviews": int(row[8]) if row[8] is not None else 0,
+            "createdAt": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+        }
+
+        _log("INFO", "User registered successfully", user_id=user_id, role=row[4])
+
+        return _response(
+            201,
+            {
+                "success": True,
+                "token": token,
+                "user": user_data,
+                "message": "Registration successful",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in register handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_login(event: dict) -> dict:
+    """
+    POST /auth/login
+    Authenticate user credentials and return a signed JWT token.
+    Uses constant-time password verification and generic error responses.
+    """
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    raw_email = body.get("email")
+    password = body.get("password")
+
+    if not raw_email or not password:
+        return _error_response(400, "Email and password are required.")
+
+    try:
+        email = validate_email(raw_email)
+    except ValueError:
+        # Return generic error to prevent account enumeration
+        return _error_response(401, "Invalid email or password.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT id, name, email, password_hash, phone, role, status, avatar_url, rating, review_count, created_at
+            FROM users
+            WHERE email = %s;
+            """,
+            (email,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            # Generic error to prevent enumeration
+            return _error_response(401, "Invalid email or password.")
+
+        user_id = str(row[0])
+        name = row[1]
+        stored_hash = row[3]
+        phone = row[4]
+        role = row[5]
+        status = row[6]
+        avatar_url = row[7]
+        rating = row[8]
+        review_count = row[9]
+        created_at = row[10]
+
+        if not verify_password(password, stored_hash):
+            return _error_response(401, "Invalid email or password.")
+
+        if status != "active":
+            return _error_response(403, "Account is suspended or deactivated.")
+
+        token = create_jwt_token(user_id=user_id, email=email, role=role)
+
+        user_data = {
+            "id": user_id,
+            "name": name,
+            "email": email,
+            "phone": phone or "",
+            "role": role,
+            "status": status,
+            "avatar": avatar_url or "",
+            "rating": float(rating) if rating is not None else 5.0,
+            "reviews": int(review_count) if review_count is not None else 0,
+            "createdAt": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+        }
+
+        _log("INFO", "User logged in successfully", user_id=user_id, role=role)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "token": token,
+                "user": user_data,
+                "message": "Login successful",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in login handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_get_me(event: dict) -> dict:
+    """
+    GET /auth/me
+    Verify the JWT token and return the authenticated user's profile.
+    """
+    headers = event.get("headers", {}) or {}
+    auth_header = headers.get("authorization") or headers.get("Authorization") or ""
+
+    if not auth_header.startswith("Bearer "):
+        return _error_response(401, "Authorization Bearer token required.")
+
+    token = auth_header[7:].strip()
+    try:
+        claims = verify_jwt_token(token)
+    except ValueError as exc:
+        return _error_response(401, f"Authentication failed: {exc}")
+
+    user_id = claims.get("sub")
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT id, name, email, phone, role, status, avatar_url, rating, review_count, created_at
+            FROM users
+            WHERE id = %s;
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return _error_response(404, "User not found.")
+
+        if row[5] != "active":
+            return _error_response(403, "Account is suspended or deactivated.")
+
+        user_data = {
+            "id": str(row[0]),
+            "name": row[1],
+            "email": row[2],
+            "phone": row[3] or "",
+            "role": row[4],
+            "status": row[5],
+            "avatar": row[6] or "",
+            "rating": float(row[7]) if row[7] is not None else 5.0,
+            "reviews": int(row[8]) if row[8] is not None else 0,
+            "createdAt": row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+        }
+
+        return _response(200, {"success": True, "user": user_data})
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in get_me handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ─── Main Lambda handler ────────────────────────────────────────────────────
+
+
+def lambda_handler(
+    event: dict,
+    context,
+) -> dict:
     """
     AWS Lambda entry point.
 
-    Receives API Gateway HTTP API (payload format 2.0) events.
+    Receives API Gateway HTTP API payload format 2.0 events.
+
     Routes on HTTP method + raw path.
     """
-    http_ctx = event.get("requestContext", {}).get("http", {})
-    method = http_ctx.get("method", "UNKNOWN")
-    path = event.get("rawPath", "/")
-    request_id = event.get("requestContext", {}).get("requestId", "unknown")
 
-    _log("INFO", "Request received",
-         method=method, path=path, request_id=request_id)
+    http_ctx = (
+        event
+        .get("requestContext", {})
+        .get("http", {})
+    )
 
-    # Route dispatch
-    if method == "GET" and path == "/health":
+    method = http_ctx.get(
+        "method",
+        "UNKNOWN",
+    )
+
+    path = event.get(
+        "rawPath",
+        "/",
+    )
+
+    request_id = (
+        event
+        .get("requestContext", {})
+        .get("requestId", "unknown")
+    )
+
+    _log(
+        "INFO",
+        "Request received",
+        method=method,
+        path=path,
+        request_id=request_id,
+    )
+
+    # ─── Route dispatch ─────────────────────────────────────────────
+    # Normalize path (handle optional /api prefix from local dev proxy)
+    clean_path = path[4:] if path.startswith("/api/") else path
+
+    if method == "GET" and (clean_path == "/health" or path == "/health"):
         return _handle_health()
 
-    if method == "GET" and path == "/db-health":
+    if method == "GET" and (clean_path == "/db-health" or path == "/db-health"):
         return _handle_db_health()
 
-    _log("WARNING", "Route not found", method=method, path=path)
-    return _error_response(404, "Not found.")
+    if method == "POST" and (clean_path == "/auth/register" or path == "/auth/register"):
+        return _handle_register(event)
+
+    if method == "POST" and (clean_path == "/auth/login" or path == "/auth/login"):
+        return _handle_login(event)
+
+    if method == "GET" and (clean_path == "/auth/me" or path == "/auth/me"):
+        return _handle_get_me(event)
+
+    # ─── Unknown route ──────────────────────────────────────────────
+
+    _log(
+        "WARNING",
+        "Route not found",
+        method=method,
+        path=path,
+    )
+
+    return _error_response(
+        404,
+        "Not found.",
+    )

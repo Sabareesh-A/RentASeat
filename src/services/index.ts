@@ -7,8 +7,10 @@ import type {
   JourneyFilterOptions,
   JourneySortOption,
   ApiResponse,
+  RegisterData,
 } from '../types';
 import { BookingStatus, JourneyStatus } from '../types';
+import { request, ApiError } from '../api/client';
 import {
   getAllJourneys,
   searchJourneys as mockSearchJourneys,
@@ -31,7 +33,7 @@ export const journeyService = {
         success: true,
         data: getAllJourneys(),
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch journeys',
@@ -48,7 +50,7 @@ export const journeyService = {
         success: true,
         data: results.filter((j) => j.availableSeats >= params.seats),
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to search journeys',
@@ -71,7 +73,7 @@ export const journeyService = {
         success: true,
         data: journey,
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch journey',
@@ -87,7 +89,7 @@ export const journeyService = {
         success: true,
         data: getJourneysByDriverId(driverId),
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch driver journeys',
@@ -198,7 +200,7 @@ export const journeyService = {
         data: newJourney,
         message: 'Journey created successfully',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to create journey',
@@ -217,7 +219,7 @@ export const bookingService = {
         success: true,
         data: getBookingsByPassengerId(passengerId),
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch bookings',
@@ -266,7 +268,7 @@ export const bookingService = {
         data: newBooking,
         message: 'Booking created successfully',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to create booking',
@@ -282,7 +284,7 @@ export const bookingService = {
         success: true,
         message: 'Booking cancelled successfully',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to cancel booking',
@@ -308,7 +310,7 @@ export const vehicleService = {
         success: true,
         data: vehicle,
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch vehicle',
@@ -330,7 +332,7 @@ export const vehicleService = {
         data: newVehicle,
         message: 'Vehicle created successfully',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to create vehicle',
@@ -356,7 +358,7 @@ export const userService = {
         success: true,
         data: user,
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch user',
@@ -373,7 +375,7 @@ export const userService = {
         success: true,
         data: drivers,
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to fetch drivers',
@@ -398,7 +400,7 @@ export const userService = {
         data: updatedUser,
         message: 'Profile updated successfully',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Failed to update profile',
@@ -407,14 +409,19 @@ export const userService = {
   },
 };
 
+interface AuthApiResponse {
+  success: boolean;
+  token?: string;
+  user?: User;
+  message?: string;
+  error?: string;
+}
+
 // Authentication Service
 export const authService = {
-  // Login
+  // Login with backend API
   async login(email: string, password: string): Promise<ApiResponse<User>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 800));
-
-      // Demo: Accept any email/password combination for testing
       if (!email || !password) {
         return {
           success: false,
@@ -422,42 +429,71 @@ export const authService = {
         };
       }
 
-      // For demo purposes, return a default user
-      const user = Object.values(mockUsers)[0];
+      const response = await request<AuthApiResponse>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+
+      if (response.success && response.user && response.token) {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('token', response.token);
+          localStorage.setItem('user', JSON.stringify(response.user));
+        }
+        return {
+          success: true,
+          data: response.user,
+          message: response.message || 'Login successful',
+        };
+      }
 
       return {
-        success: true,
-        data: user,
-        message: 'Login successful',
+        success: false,
+        error: response.error || 'Login failed',
       };
-    } catch (error) {
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Login failed. Network or server error.';
       return {
         success: false,
-        error: 'Login failed',
+        error: message,
       };
     }
   },
 
-  // Register
-  async register(userData: any): Promise<ApiResponse<User>> {
+  // Register with backend API
+  async register(userData: RegisterData): Promise<ApiResponse<User>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const response = await request<AuthApiResponse>('/auth/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: userData.name,
+          email: userData.email,
+          password: userData.password,
+          phone: userData.phone,
+          role: userData.role || 'passenger',
+        }),
+      });
 
-      const newUser: User = {
-        id: `user_${Date.now()}`,
-        ...userData,
-        createdAt: new Date(),
-      };
+      if (response.success && response.user && response.token) {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('token', response.token);
+          localStorage.setItem('user', JSON.stringify(response.user));
+        }
+        return {
+          success: true,
+          data: response.user,
+          message: response.message || 'Registration successful',
+        };
+      }
 
-      return {
-        success: true,
-        data: newUser,
-        message: 'Registration successful',
-      };
-    } catch (error) {
       return {
         success: false,
-        error: 'Registration failed',
+        error: response.error || 'Registration failed',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Registration failed. Network or server error.';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
@@ -465,12 +501,15 @@ export const authService = {
   // Logout
   async logout(): Promise<ApiResponse<void>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+      }
       return {
         success: true,
         message: 'Logout successful',
       };
-    } catch (error) {
+    } catch {
       return {
         success: false,
         error: 'Logout failed',
@@ -478,35 +517,52 @@ export const authService = {
     }
   },
 
-  // Reset password request
-  async resetPasswordRequest(_email: string): Promise<ApiResponse<void>> {
+  // Get current user session
+  async getCurrentUser(): Promise<ApiResponse<User>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      return {
-        success: true,
-        message: 'Password reset email sent',
-      };
-    } catch (error) {
+      const token = typeof localStorage !== 'undefined' ? localStorage.getItem('token') : null;
+      if (!token) {
+        return {
+          success: false,
+          error: 'No active session token',
+        };
+      }
+
+      const response = await request<{ success: boolean; user?: User; error?: string }>('/auth/me');
+      if (response.success && response.user) {
+        localStorage.setItem('user', JSON.stringify(response.user));
+        return {
+          success: true,
+          data: response.user,
+        };
+      }
+
       return {
         success: false,
-        error: 'Failed to send reset email',
+        error: response.error || 'Failed to retrieve session',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Session verification failed';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
 
-  // Reset password
+  // Reset password request (documented as pending - no email verification infrastructure yet)
+  async resetPasswordRequest(_email: string): Promise<ApiResponse<void>> {
+    return {
+      success: false,
+      error: 'Password reset is pending email verification infrastructure setup.',
+    };
+  },
+
+  // Reset password (documented as pending)
   async resetPassword(_token: string, _newPassword: string): Promise<ApiResponse<void>> {
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      return {
-        success: true,
-        message: 'Password reset successful',
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: 'Failed to reset password',
-      };
-    }
+    return {
+      success: false,
+      error: 'Password reset is pending email verification infrastructure setup.',
+    };
   },
 };

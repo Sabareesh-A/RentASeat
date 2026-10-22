@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Navbar } from '../../components/ui';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
@@ -6,19 +6,21 @@ import { Card } from '../../components/ui/Card';
 import { userService } from '../../services';
 
 const PassengerProfile: React.FC = () => {
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState<any>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('user') || '{}');
+    } catch {
+      return {};
+    }
+  });
   const [editMode, setEditMode] = useState(false);
-  const [formData, setFormData] = useState<any>({});
-
-  useEffect(() => {
-    loadProfile();
-  }, []);
-
-  const loadProfile = () => {
-    const userData = JSON.parse(localStorage.getItem('user') || '{}');
-    setUser(userData);
-    setFormData(userData);
-  };
+  const [formData, setFormData] = useState<any>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('user') || '{}');
+    } catch {
+      return {};
+    }
+  });
 
   const handleSave = async () => {
     try {
@@ -28,7 +30,7 @@ const PassengerProfile: React.FC = () => {
         localStorage.setItem('user', JSON.stringify(response.data));
         setEditMode(false);
       }
-    } catch (err) {
+    } catch {
       console.error('Failed to update profile');
     }
   };
