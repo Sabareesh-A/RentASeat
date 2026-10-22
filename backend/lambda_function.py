@@ -68,6 +68,7 @@ except ImportError:
     pg8000_dbapi = None
 
 from auth import (
+    DUMMY_PASSWORD_HASH,
     create_jwt_token,
     hash_password,
     validate_email,
@@ -778,16 +779,23 @@ def _handle_register(event: dict) -> dict:
         # Hash password using scrypt
         pw_hash = hash_password(password)
 
-        cursor.execute(
-            """
-            INSERT INTO users (name, email, password_hash, phone, role, status)
-            VALUES (%s, %s, %s, %s, %s, 'active')
-            RETURNING id, name, email, phone, role, status, avatar_url, rating, review_count, created_at;
-            """,
-            (name, email, pw_hash, phone, role),
-        )
-        row = cursor.fetchone()
-        conn.commit()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO users (name, email, password_hash, phone, role, status)
+                VALUES (%s, %s, %s, %s, %s, 'active')
+                RETURNING id, name, email, phone, role, status, avatar_url, rating, review_count, created_at;
+                """,
+                (name, email, pw_hash, phone, role),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+        except Exception as insert_exc:
+            conn.rollback()
+            err_msg = str(insert_exc).lower()
+            if "unique" in err_msg or "duplicate" in err_msg or "uq_users_email" in err_msg:
+                return _error_response(409, "An account with this email already exists.")
+            raise
 
         user_id = str(row[0])
         token = create_jwt_token(user_id=user_id, email=row[2], role=row[4])
@@ -874,7 +882,8 @@ def _handle_login(event: dict) -> dict:
         row = cursor.fetchone()
 
         if not row:
-            # Generic error to prevent enumeration
+            # Perform dummy scrypt computation to eliminate timing-based account enumeration
+            verify_password(password, DUMMY_PASSWORD_HASH)
             return _error_response(401, "Invalid email or password.")
 
         user_id = str(row[0])

@@ -77,6 +77,12 @@ export async function request<T = unknown>(
   }
 
   if (!response.ok) {
+    if (response.status === 401 && typeof localStorage !== 'undefined') {
+      // Clear invalid or expired session tokens automatically
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+    }
+
     const message =
       typeof body === 'object' && body !== null && 'error' in body
         ? String((body as Record<string, unknown>).error)

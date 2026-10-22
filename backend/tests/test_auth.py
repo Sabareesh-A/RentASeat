@@ -6,12 +6,16 @@ input validation, and Lambda request handling (offline with mocks).
 """
 
 import json
+import os
 import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from backend.auth import (
+    DUMMY_PASSWORD_HASH,
+    _b64url_encode,
     create_jwt_token,
+    get_jwt_secret,
     hash_password,
     validate_email,
     validate_name,
@@ -44,6 +48,31 @@ class TestPasswordHashing(unittest.TestCase):
     def test_verify_malformed_hash(self):
         self.assertFalse(verify_password("Password123!", "invalid_hash_string"))
         self.assertFalse(verify_password("Password123!", "scrypt$1$2$3$corrupt$corrupt"))
+
+    def test_verify_parameter_bounds(self):
+        # Exceeding N (e.g. 131072)
+        oversized_n = "scrypt$131072$8$1$" + "00" * 16 + "$" + "00" * 64
+        self.assertFalse(verify_password("Password123!", oversized_n))
+
+        # Non-power-of-two N
+        invalid_n = "scrypt$10000$8$1$" + "00" * 16 + "$" + "00" * 64
+        self.assertFalse(verify_password("Password123!", invalid_n))
+
+        # Oversized r
+        oversized_r = "scrypt$16384$32$1$" + "00" * 16 + "$" + "00" * 64
+        self.assertFalse(verify_password("Password123!", oversized_r))
+
+        # Oversized p
+        oversized_p = "scrypt$16384$8$16$" + "00" * 16 + "$" + "00" * 64
+        self.assertFalse(verify_password("Password123!", oversized_p))
+
+        # Salt too short (<16 bytes)
+        short_salt = "scrypt$16384$8$1$" + "00" * 8 + "$" + "00" * 64
+        self.assertFalse(verify_password("Password123!", short_salt))
+
+    def test_dummy_hash_properties(self):
+        self.assertTrue(DUMMY_PASSWORD_HASH.startswith("scrypt$16384$8$1$"))
+        self.assertFalse(verify_password("AnyPassword!", DUMMY_PASSWORD_HASH))
 
 
 class TestJWTToken(unittest.TestCase):
@@ -84,6 +113,40 @@ class TestJWTToken(unittest.TestCase):
             verify_jwt_token("not-a-token")
         with self.assertRaises(ValueError):
             verify_jwt_token("")
+
+    def test_reject_non_hs256_algorithm(self):
+        # Algorithm 'none' attack attempt
+        header_none = _b64url_encode(b'{"alg":"none","typ":"JWT"}')
+        payload = _b64url_encode(b'{"sub":"user1","exp":9999999999}')
+        token_none = f"{header_none}.{payload}."
+        with self.assertRaises(ValueError) as ctx:
+            verify_jwt_token(token_none)
+        self.assertIn("algorithm", str(ctx.exception).lower())
+
+        # Asymmetric algorithm RS256 attempt
+        header_rs256 = _b64url_encode(b'{"alg":"RS256","typ":"JWT"}')
+        token_rs256 = f"{header_rs256}.{payload}.signature"
+        with self.assertRaises(ValueError) as ctx:
+            verify_jwt_token(token_rs256)
+        self.assertIn("algorithm", str(ctx.exception).lower())
+
+    def test_production_jwt_secret_enforcement(self):
+        # When AWS_LAMBDA_FUNCTION_NAME is set, empty secret must raise RuntimeError
+        with patch.dict(os.environ, {"AWS_LAMBDA_FUNCTION_NAME": "rentaseat-prod", "JWT_SECRET": ""}):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_jwt_secret()
+            self.assertIn("mandatory in deployed environments", str(ctx.exception))
+
+        # When AWS_LAMBDA_FUNCTION_NAME is set, secret < 32 chars must raise RuntimeError
+        with patch.dict(os.environ, {"AWS_LAMBDA_FUNCTION_NAME": "rentaseat-prod", "JWT_SECRET": "too-short"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                get_jwt_secret()
+            self.assertIn("at least 32 characters", str(ctx.exception))
+
+        # Valid 32+ char secret in deployed environment succeeds
+        valid_secret = "a" * 32
+        with patch.dict(os.environ, {"AWS_LAMBDA_FUNCTION_NAME": "rentaseat-prod", "JWT_SECRET": valid_secret}):
+            self.assertEqual(get_jwt_secret(), valid_secret)
 
 
 class TestInputValidation(unittest.TestCase):
@@ -368,6 +431,64 @@ class TestLambdaAuthRouting(unittest.TestCase):
         self.assertEqual(resp["statusCode"], 403)
         data = json.loads(resp["body"])
         self.assertIn("suspended", data["error"].lower())
+
+    @patch("backend.lambda_function._get_db_connection")
+    @patch("backend.lambda_function.verify_password")
+    def test_login_nonexistent_user_executes_dummy_verification(self, mock_verify, mock_conn_fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn_fn.return_value = mock_conn
+
+        # User not found in DB
+        mock_cursor.fetchone.return_value = None
+
+        event = {
+            "requestContext": {"http": {"method": "POST", "requestId": "test-req-12"}},
+            "rawPath": "/auth/login",
+            "body": json.dumps({
+                "email": "nonexistent@example.com",
+                "password": "Password123!",
+            }),
+        }
+
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 401)
+        data = json.loads(resp["body"])
+        self.assertEqual(data["error"], "Invalid email or password.")
+        # Verifies dummy password computation was called to prevent timing enumeration
+        mock_verify.assert_called_once_with("Password123!", DUMMY_PASSWORD_HASH)
+
+    @patch("backend.lambda_function._get_db_connection")
+    def test_register_race_condition_unique_violation_returns_409(self, mock_conn_fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn_fn.return_value = mock_conn
+
+        # Check passes (None)
+        mock_cursor.fetchone.return_value = None
+        # But INSERT fails with unique constraint error
+        mock_cursor.execute.side_effect = [
+            None,  # SELECT email check
+            Exception('duplicate key value violates unique constraint "uq_users_email"'),
+        ]
+
+        event = {
+            "requestContext": {"http": {"method": "POST", "requestId": "test-req-13"}},
+            "rawPath": "/auth/register",
+            "body": json.dumps({
+                "name": "Race User",
+                "email": "race@example.com",
+                "password": "Password123!",
+            }),
+        }
+
+        resp = lambda_handler(event, None)
+        self.assertEqual(resp["statusCode"], 409)
+        data = json.loads(resp["body"])
+        self.assertIn("already exists", data["error"])
+        mock_conn.rollback.assert_called_once()
 
 
 if __name__ == "__main__":

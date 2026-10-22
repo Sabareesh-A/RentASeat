@@ -36,16 +36,38 @@ PHONE_REGEX = re.compile(
 # Allowed public self-registration roles
 ALLOWED_PUBLIC_ROLES = {"passenger", "driver"}
 
+# Dummy scrypt hash used for timing attack mitigation during failed logins
+# when the specified email is not found in the database.
+# Matches: scrypt$16384$8$1$<16 zero bytes hex>$<64 zero bytes hex>
+DUMMY_PASSWORD_HASH = (
+    "scrypt$16384$8$1$"
+    + "00" * 16
+    + "$"
+    + "00" * 64
+)
+
 
 def get_jwt_secret() -> str:
     """
     Retrieve the JWT signing secret from the Lambda environment.
-    Falls back to a secure development default with a warning.
+    Falls back to a secure development default for local/offline testing only.
+    Enforces presence and length in deployed environments.
     """
     secret = os.environ.get("JWT_SECRET", "")
     if not secret:
+        # In deployed AWS environments, enforce that JWT_SECRET is explicitly configured
+        if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+            raise RuntimeError(
+                "JWT_SECRET environment variable is mandatory in deployed environments."
+            )
         # Fallback for local development and offline testing only
         return "rentaseat-dev-jwt-signing-secret-key-32chars!"
+
+    if len(secret) < 32 and os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        raise RuntimeError(
+            "JWT_SECRET must be at least 32 characters long in deployed environments."
+        )
+
     return secret
 
 
@@ -87,6 +109,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
     """
     Verify a plaintext password against a stored scrypt hash string.
     Uses hmac.compare_digest for constant-time comparison to prevent timing attacks.
+    Enforces strict parameter bounds to prevent denial-of-service via resource exhaustion.
     """
     if not password or not stored_hash:
         return False
@@ -99,8 +122,22 @@ def verify_password(password: str, stored_hash: str) -> bool:
         n = int(parts[1])
         r = int(parts[2])
         p = int(parts[3])
+
+        # Enforce parameter bounds to prevent DoS (memory/CPU exhaustion)
+        if n < 1024 or n > 65536 or (n & (n - 1)) != 0:
+            return False
+        if r < 1 or r > 16:
+            return False
+        if p < 1 or p > 4:
+            return False
+
         salt = bytes.fromhex(parts[4])
+        if len(salt) < 16 or len(salt) > 64:
+            return False
+
         expected_key = bytes.fromhex(parts[5])
+        if len(expected_key) < 32 or len(expected_key) > 128:
+            return False
 
         actual_key = hashlib.scrypt(
             password.encode("utf-8"),
@@ -167,6 +204,7 @@ def create_jwt_token(
 def verify_jwt_token(token: str) -> dict[str, Any]:
     """
     Verify signature, format, and expiration of a JWT token.
+    Enforces algorithm explicitly to HS256 to prevent algorithm confusion attacks.
     Returns the decoded claims dictionary.
     Raises ValueError on invalid token, signature mismatch, or expiration.
     """
@@ -178,6 +216,26 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
         raise ValueError("Invalid JWT token format.")
 
     header_b64, payload_b64, signature_b64 = parts
+
+    # Enforce header algorithm and type validation
+    try:
+        header_bytes = _b64url_decode(header_b64)
+        header = json.loads(header_bytes.decode("utf-8"))
+    except Exception:
+        raise ValueError("Invalid token header.")
+
+    if not isinstance(header, dict):
+        raise ValueError("Invalid token header format.")
+
+    # Explicitly enforce algorithm to HS256 (reject 'none', asymmetric algs, or unexpected values)
+    if header.get("alg") != "HS256":
+        raise ValueError(
+            f"Unsupported token algorithm '{header.get('alg')}'. Only HS256 is accepted."
+        )
+
+    if header.get("typ") not in ("JWT", None):
+        raise ValueError(f"Unsupported token type '{header.get('typ')}'.")
+
     secret = get_jwt_secret()
     signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
 
