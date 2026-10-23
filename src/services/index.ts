@@ -9,33 +9,44 @@ import type {
   ApiResponse,
   RegisterData,
 } from '../types';
-import { BookingStatus, JourneyStatus } from '../types';
+import { BookingStatus } from '../types';
 import { request, ApiError } from '../api/client';
 import {
-  getAllJourneys,
-  searchJourneys as mockSearchJourneys,
   getJourneyById,
-  getJourneysByDriverId,
   getBookingsByPassengerId,
   getUserById,
   mockUsers,
 } from '../data/mock';
+
+interface JourneyApiResponse {
+  success: boolean;
+  journey?: Journey;
+  journeys?: Journey[];
+  message?: string;
+  error?: string;
+}
 
 // Journey Service
 export const journeyService = {
   // Get all journeys
   async getAllJourneys(): Promise<ApiResponse<Journey[]>> {
     try {
-      // Simulate API call delay
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      return {
-        success: true,
-        data: getAllJourneys(),
-      };
-    } catch {
+      const response = await request<JourneyApiResponse>('/journeys');
+      if (response.success && response.journeys) {
+        return {
+          success: true,
+          data: response.journeys,
+        };
+      }
       return {
         success: false,
-        error: 'Failed to fetch journeys',
+        error: response.error || 'Failed to fetch journeys',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch journeys';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
@@ -43,16 +54,29 @@ export const journeyService = {
   // Search journeys
   async searchJourneys(params: SearchParams): Promise<ApiResponse<Journey[]>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      const results = mockSearchJourneys(params.from, params.to, params.date);
-      return {
-        success: true,
-        data: results.filter((j) => j.availableSeats >= params.seats),
-      };
-    } catch {
+      const queryParts: string[] = [];
+      if (params.from) queryParts.push(`from=${encodeURIComponent(params.from)}`);
+      if (params.to) queryParts.push(`to=${encodeURIComponent(params.to)}`);
+      if (params.date) queryParts.push(`date=${encodeURIComponent(params.date)}`);
+      if (params.seats) queryParts.push(`seats=${encodeURIComponent(params.seats.toString())}`);
+
+      const queryString = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
+      const response = await request<JourneyApiResponse>(`/journeys${queryString}`);
+      if (response.success && response.journeys) {
+        return {
+          success: true,
+          data: response.journeys,
+        };
+      }
       return {
         success: false,
-        error: 'Failed to search journeys',
+        error: response.error || 'Failed to search journeys',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to search journeys';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
@@ -60,22 +84,22 @@ export const journeyService = {
   // Get journey by ID
   async getJourneyById(id: string): Promise<ApiResponse<Journey>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      const journey = getJourneyById(id);
-      if (!journey) {
+      const response = await request<JourneyApiResponse>(`/journeys/${id}`);
+      if (response.success && response.journey) {
         return {
-          success: false,
-          error: 'Journey not found',
+          success: true,
+          data: response.journey,
         };
       }
       return {
-        success: true,
-        data: journey,
+        success: false,
+        error: response.error || 'Journey not found',
       };
-    } catch {
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch journey';
       return {
         success: false,
-        error: 'Failed to fetch journey',
+        error: message,
       };
     }
   },
@@ -83,15 +107,22 @@ export const journeyService = {
   // Get journeys by driver
   async getJourneysByDriver(driverId: string): Promise<ApiResponse<Journey[]>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      return {
-        success: true,
-        data: getJourneysByDriverId(driverId),
-      };
-    } catch {
+      const response = await request<JourneyApiResponse>(`/journeys?driverId=${encodeURIComponent(driverId)}&status=all`);
+      if (response.success && response.journeys) {
+        return {
+          success: true,
+          data: response.journeys,
+        };
+      }
       return {
         success: false,
-        error: 'Failed to fetch driver journeys',
+        error: response.error || 'Failed to fetch driver journeys',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch driver journeys';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
@@ -127,11 +158,11 @@ export const journeyService = {
         return false;
       }
 
-      if (filters.vehicleType && journey.vehicle.vehicleType !== filters.vehicleType) {
+      if (filters.vehicleType && journey.vehicle && journey.vehicle.vehicleType !== filters.vehicleType) {
         return false;
       }
 
-      if (filters.rating && journey.driver.rating) {
+      if (filters.rating && journey.driver && journey.driver.rating) {
         if (journey.driver.rating < filters.rating) {
           return false;
         }
@@ -158,8 +189,8 @@ export const journeyService = {
         aValue = a.departureTime;
         bValue = b.departureTime;
       } else if (sortOption.field === 'rating') {
-        aValue = a.driver.rating || 0;
-        bValue = b.driver.rating || 0;
+        aValue = a.driver?.rating || 0;
+        bValue = b.driver?.rating || 0;
       }
 
       if (aValue < bValue) return sortOption.order === 'asc' ? -1 : 1;
@@ -173,36 +204,91 @@ export const journeyService = {
   // Create journey
   async createJourney(journeyData: any): Promise<ApiResponse<Journey>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      const driverId = 'user1'; // In real app, get from auth context
-      const driver = mockUsers[driverId] as User;
-      const newJourney: Journey = {
-        id: `journey_${Date.now()}`,
-        driverId: driverId,
-        driver: driver,
+      const payload = {
         from: journeyData.from,
         to: journeyData.to,
         date: journeyData.date,
         departureTime: journeyData.departureTime,
-        arrivalTime: journeyData.arrivalTime,
-        availableSeats: parseInt(journeyData.availableSeats),
-        totalSeats: parseInt(journeyData.availableSeats),
-        pricePerSeat: parseFloat(journeyData.pricePerSeat),
-        vehicle: null as any, // Mock vehicle
-        status: JourneyStatus.ACTIVE,
+        arrivalTime: journeyData.arrivalTime || undefined,
+        totalSeats: parseInt(journeyData.availableSeats || journeyData.totalSeats || '1', 10),
+        pricePerSeat: parseFloat(journeyData.pricePerSeat || '0'),
+        vehicleId: journeyData.vehicleId,
         description: journeyData.description || '',
-        stops: [],
-        createdAt: new Date(),
       };
-      return {
-        success: true,
-        data: newJourney,
-        message: 'Journey created successfully',
-      };
-    } catch {
+
+      const response = await request<JourneyApiResponse>('/journeys', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+
+      if (response.success && response.journey) {
+        return {
+          success: true,
+          data: response.journey,
+          message: response.message || 'Journey created successfully',
+        };
+      }
       return {
         success: false,
-        error: 'Failed to create journey',
+        error: response.error || 'Failed to create journey',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to create journey';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Update journey
+  async updateJourney(id: string, updates: Partial<Journey>): Promise<ApiResponse<Journey>> {
+    try {
+      const response = await request<JourneyApiResponse>(`/journeys/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+      if (response.success && response.journey) {
+        return {
+          success: true,
+          data: response.journey,
+          message: response.message || 'Journey updated successfully',
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to update journey',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to update journey';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Delete journey
+  async deleteJourney(id: string): Promise<ApiResponse<void>> {
+    try {
+      const response = await request<{ success: boolean; message?: string; error?: string }>(`/journeys/${id}`, {
+        method: 'DELETE',
+      });
+      if (response.success) {
+        return {
+          success: true,
+          message: response.message || 'Journey deleted successfully',
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to delete journey',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to delete journey';
+      return {
+        success: false,
+        error: message,
       };
     }
   },

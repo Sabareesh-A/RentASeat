@@ -84,6 +84,13 @@ from vehicles import (
     format_vehicle_row,
     validate_vehicle_payload,
 )
+from journeys import (
+    DATE_REGEX,
+    format_journey_row,
+    validate_departure_date,
+    validate_endpoints,
+    validate_journey_payload,
+)
 
 
 # ─── Logging ────────────────────────────────────────────────────────────────
@@ -1571,7 +1578,640 @@ def _handle_delete_vehicle(event: dict, vehicle_id: str) -> dict:
                 pass
 
 
+# ─── Journey Regex & Handlers ───────────────────────────────────────────────
+
+JOURNEY_PATH_REGEX = re.compile(r"^/journeys/([a-zA-Z0-9_-]{1,64})$")
+
+
+def _handle_create_journey(event: dict) -> dict:
+    """
+    POST /journeys
+    Publish a new journey for the authenticated driver.
+    Enforces active-account status, driver/admin role, and vehicle ownership.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    try:
+        validated = validate_journey_payload(body, is_update=False)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        if user["role"] not in ("driver", "admin"):
+            return _error_response(403, "Driver role required to publish journeys.")
+
+        driver_id = user["id"]
+        # Allow admin to assign journey to a specific driver if requested
+        if user["role"] == "admin":
+            specified_driver = body.get("driverId") or body.get("driver_id")
+            if specified_driver:
+                cursor.execute(
+                    "SELECT id, role, status FROM users WHERE id = %s;",
+                    (specified_driver,),
+                )
+                d_row = cursor.fetchone()
+                if not d_row:
+                    return _error_response(404, "Specified driver not found.")
+                if d_row[1] != "driver":
+                    return _error_response(400, "Specified user is not a driver.")
+                driver_id = str(d_row[0])
+
+        # Verify referenced vehicle exists and belongs to the driver
+        cursor.execute(
+            """
+            SELECT id, driver_id, seating_capacity
+            FROM vehicles
+            WHERE id = %s;
+            """,
+            (validated["vehicle_id"],),
+        )
+        veh_row = cursor.fetchone()
+        if not veh_row:
+            return _error_response(404, "Referenced vehicle does not exist.")
+
+        if str(veh_row[1]) != driver_id:
+            return _error_response(403, "Vehicle does not belong to the journey driver.")
+
+        veh_capacity = int(veh_row[2])
+        if validated["total_seats"] > veh_capacity:
+            return _error_response(
+                400,
+                f"Journey total seats ({validated['total_seats']}) cannot exceed vehicle seating capacity ({veh_capacity}).",
+            )
+
+        available_seats = validated["total_seats"]
+        stops_json = json.dumps(validated["stops"])
+
+        cursor.execute(
+            """
+            INSERT INTO journeys (
+                driver_id, vehicle_id, origin, destination,
+                departure_date, departure_time, arrival_time,
+                total_seats, available_seats, price_per_seat,
+                status, description, stops
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                driver_id,
+                validated["vehicle_id"],
+                validated["origin"],
+                validated["destination"],
+                validated["departure_date"],
+                validated["departure_time"],
+                validated["arrival_time"],
+                validated["total_seats"],
+                available_seats,
+                validated["price_per_seat"],
+                validated["status"],
+                validated["description"],
+                stops_json,
+            ),
+        )
+        new_row = cursor.fetchone()
+        journey_id = str(new_row[0])
+
+        # Query full joined record with driver and vehicle
+        cursor.execute(
+            """
+            SELECT
+                j.id, j.driver_id, j.vehicle_id, j.origin, j.destination,
+                j.departure_date, j.departure_time, j.arrival_time,
+                j.total_seats, j.available_seats, j.price_per_seat,
+                j.status, j.description, j.stops, j.created_at, j.updated_at,
+                u.name, u.email, u.phone, u.role, u.avatar_url, u.rating, u.review_count,
+                v.registration_number, v.vehicle_type, v.model, v.colour, v.seating_capacity, v.image_url
+            FROM journeys j
+            JOIN users u ON j.driver_id = u.id
+            JOIN vehicles v ON j.vehicle_id = v.id
+            WHERE j.id = %s;
+            """,
+            (journey_id,),
+        )
+        joined_row = cursor.fetchone()
+        conn.commit()
+
+        journey_data = format_journey_row(joined_row)
+        _log("INFO", "Journey created successfully", journey_id=journey_id, driver_id=driver_id)
+
+        return _response(
+            201,
+            {
+                "success": True,
+                "journey": journey_data,
+                "message": "Journey created successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in create_journey handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_list_journeys(event: dict) -> dict:
+    """
+    GET /journeys
+    Search and list journeys with parameterised filtering.
+    Publicly accessible (supports unauthenticated search) and supports driverId/status filtering.
+    """
+    params = event.get("queryStringParameters") or {}
+    origin_param = params.get("origin") or params.get("from")
+    dest_param = params.get("destination") or params.get("to")
+    date_param = params.get("date") or params.get("departureDate") or params.get("departure_date")
+    seats_param = params.get("seats") or params.get("availableSeats") or params.get("available_seats")
+    driver_param = params.get("driverId") or params.get("driver_id")
+    status_param = params.get("status")
+
+    where_clauses = []
+    sql_params = []
+
+    # Status filter
+    if status_param and status_param.lower() != "all":
+        where_clauses.append("j.status = %s")
+        sql_params.append(status_param.lower())
+    elif not status_param:
+        where_clauses.append("j.status = 'active'")
+
+    # Origin filter (case-insensitive substring)
+    if origin_param and origin_param.strip():
+        where_clauses.append("LOWER(j.origin) LIKE LOWER(%s)")
+        sql_params.append(f"%{origin_param.strip()}%")
+
+    # Destination filter (case-insensitive substring)
+    if dest_param and dest_param.strip():
+        where_clauses.append("LOWER(j.destination) LIKE LOWER(%s)")
+        sql_params.append(f"%{dest_param.strip()}%")
+
+    # Departure Date filter
+    if date_param and date_param.strip():
+        date_str = date_param.strip()
+        # Enforce basic date format validation
+        if not DATE_REGEX.match(date_str):
+            return _error_response(400, "Invalid date format. Expected YYYY-MM-DD.")
+        where_clauses.append("j.departure_date = %s")
+        sql_params.append(date_str)
+
+    # Available seats filter
+    if seats_param and seats_param.strip():
+        try:
+            req_seats = int(seats_param.strip())
+            where_clauses.append("j.available_seats >= %s")
+            sql_params.append(req_seats)
+        except (ValueError, TypeError):
+            return _error_response(400, "Seats parameter must be an integer.")
+
+    # Driver filter
+    if driver_param and driver_param.strip():
+        where_clauses.append("j.driver_id = %s")
+        sql_params.append(driver_param.strip())
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    query = f"""
+        SELECT
+            j.id, j.driver_id, j.vehicle_id, j.origin, j.destination,
+            j.departure_date, j.departure_time, j.arrival_time,
+            j.total_seats, j.available_seats, j.price_per_seat,
+            j.status, j.description, j.stops, j.created_at, j.updated_at,
+            u.name, u.email, u.phone, u.role, u.avatar_url, u.rating, u.review_count,
+            v.registration_number, v.vehicle_type, v.model, v.colour, v.seating_capacity, v.image_url
+        FROM journeys j
+        JOIN users u ON j.driver_id = u.id
+        JOIN vehicles v ON j.vehicle_id = v.id
+        {where_sql}
+        ORDER BY j.departure_date ASC, j.departure_time ASC
+        LIMIT 50;
+    """
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(query, tuple(sql_params))
+        rows = cursor.fetchall()
+        journeys = [format_journey_row(r) for r in rows]
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "journeys": journeys,
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in list_journeys handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_get_journey(event: dict, journey_id: str) -> dict:
+    """
+    GET /journeys/{id}
+    Retrieve full journey details including driver and vehicle profiles.
+    Publicly accessible.
+    """
+    if not journey_id:
+        return _error_response(400, "Journey ID is required.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                j.id, j.driver_id, j.vehicle_id, j.origin, j.destination,
+                j.departure_date, j.departure_time, j.arrival_time,
+                j.total_seats, j.available_seats, j.price_per_seat,
+                j.status, j.description, j.stops, j.created_at, j.updated_at,
+                u.name, u.email, u.phone, u.role, u.avatar_url, u.rating, u.review_count,
+                v.registration_number, v.vehicle_type, v.model, v.colour, v.seating_capacity, v.image_url
+            FROM journeys j
+            JOIN users u ON j.driver_id = u.id
+            JOIN vehicles v ON j.vehicle_id = v.id
+            WHERE j.id = %s;
+            """,
+            (journey_id,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return _error_response(404, "Journey not found.")
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "journey": format_journey_row(row),
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in get_journey handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_update_journey(event: dict, journey_id: str) -> dict:
+    """
+    PUT /journeys/{id} or PATCH /journeys/{id}
+    Update journey fields. Enforces ownership or admin permission,
+    vehicle capacity constraints, and prevents changes that invalidate existing bookings.
+    """
+    if not journey_id:
+        return _error_response(400, "Journey ID is required.")
+
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    try:
+        validated = validate_journey_payload(body, is_update=True)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    if not validated:
+        return _error_response(400, "No valid fields provided to update.")
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        # Fetch existing journey
+        cursor.execute(
+            """
+            SELECT id, driver_id, vehicle_id, origin, destination,
+                   departure_date, departure_time, arrival_time,
+                   total_seats, available_seats, price_per_seat,
+                   status, description, stops
+            FROM journeys
+            WHERE id = %s;
+            """,
+            (journey_id,),
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            return _error_response(404, "Journey not found.")
+
+        # Enforce owning driver or admin permission
+        if str(existing[1]) != user["id"] and user["role"] != "admin":
+            return _error_response(403, "You do not have permission to modify this journey.")
+
+        # Check existing active/confirmed bookings
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(seats_booked), 0)
+            FROM bookings
+            WHERE journey_id = %s AND status NOT IN ('cancelled');
+            """,
+            (journey_id,),
+        )
+        b_row = cursor.fetchone()
+        booked_seats = int(b_row[0]) if b_row else 0
+
+        # Validate total_seats change against booked seats
+        new_total_seats = validated.get("total_seats", existing[8])
+        if new_total_seats < booked_seats:
+            return _error_response(
+                409,
+                f"Cannot reduce total seats to {new_total_seats}. {booked_seats} seat(s) are already booked on this journey.",
+            )
+
+        # Vehicle validation (if vehicle is changed or seats changed)
+        new_vehicle_id = validated.get("vehicle_id", str(existing[2]))
+        cursor.execute(
+            """
+            SELECT id, driver_id, seating_capacity
+            FROM vehicles
+            WHERE id = %s;
+            """,
+            (new_vehicle_id,),
+        )
+        v_row = cursor.fetchone()
+        if not v_row:
+            return _error_response(404, "Referenced vehicle does not exist.")
+
+        journey_driver_id = str(existing[1])
+        if str(v_row[1]) != journey_driver_id:
+            return _error_response(403, "Vehicle does not belong to the journey driver.")
+
+        if new_total_seats > int(v_row[2]):
+            return _error_response(
+                400,
+                f"Journey total seats ({new_total_seats}) cannot exceed vehicle seating capacity ({v_row[2]}).",
+            )
+
+        new_available_seats = new_total_seats - booked_seats
+
+        new_origin = validated.get("origin", existing[3])
+        new_dest = validated.get("destination", existing[4])
+        validate_endpoints(new_origin, new_dest)
+
+        new_dep_date = validated.get("departure_date", str(existing[5]))
+        new_dep_time = validated.get("departure_time", str(existing[6]))
+        new_arr_time = validated["arrival_time"] if "arrival_time" in validated else existing[7]
+        new_price = validated.get("price_per_seat", existing[10])
+        new_status = validated.get("status", existing[11])
+        new_desc = validated["description"] if "description" in validated else existing[12]
+
+        if "stops" in validated:
+            new_stops_json = json.dumps(validated["stops"])
+        else:
+            new_stops_json = existing[13] if isinstance(existing[13], str) else json.dumps(existing[13] or [])
+
+        cursor.execute(
+            """
+            UPDATE journeys
+            SET origin = %s,
+                destination = %s,
+                departure_date = %s,
+                departure_time = %s,
+                arrival_time = %s,
+                total_seats = %s,
+                available_seats = %s,
+                price_per_seat = %s,
+                status = %s,
+                description = %s,
+                stops = %s,
+                vehicle_id = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s;
+            """,
+            (
+                new_origin,
+                new_dest,
+                new_dep_date,
+                new_dep_time,
+                new_arr_time,
+                new_total_seats,
+                new_available_seats,
+                new_price,
+                new_status,
+                new_desc,
+                new_stops_json,
+                new_vehicle_id,
+                journey_id,
+            ),
+        )
+
+        # Retrieve updated full joined record
+        cursor.execute(
+            """
+            SELECT
+                j.id, j.driver_id, j.vehicle_id, j.origin, j.destination,
+                j.departure_date, j.departure_time, j.arrival_time,
+                j.total_seats, j.available_seats, j.price_per_seat,
+                j.status, j.description, j.stops, j.created_at, j.updated_at,
+                u.name, u.email, u.phone, u.role, u.avatar_url, u.rating, u.review_count,
+                v.registration_number, v.vehicle_type, v.model, v.colour, v.seating_capacity, v.image_url
+            FROM journeys j
+            JOIN users u ON j.driver_id = u.id
+            JOIN vehicles v ON j.vehicle_id = v.id
+            WHERE j.id = %s;
+            """,
+            (journey_id,),
+        )
+        updated_row = cursor.fetchone()
+        conn.commit()
+
+        journey_data = format_journey_row(updated_row)
+        _log("INFO", "Journey updated successfully", journey_id=journey_id)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "journey": journey_data,
+                "message": "Journey updated successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in update_journey handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_delete_journey(event: dict, journey_id: str) -> dict:
+    """
+    DELETE /journeys/{id}
+    Delete a journey only if it has zero associated bookings.
+    If bookings exist, returns 409 Conflict instructing caller to cancel instead.
+    Enforces owning driver or admin permission.
+    """
+    if not journey_id:
+        return _error_response(400, "Journey ID is required.")
+
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        cursor.execute(
+            """
+            SELECT id, driver_id
+            FROM journeys
+            WHERE id = %s;
+            """,
+            (journey_id,),
+        )
+        existing = cursor.fetchone()
+
+        if not existing:
+            return _error_response(404, "Journey not found.")
+
+        # Enforce owning driver or admin role
+        if str(existing[1]) != user["id"] and user["role"] != "admin":
+            return _error_response(403, "You do not have permission to delete this journey.")
+
+        # Check for existing bookings
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM bookings
+            WHERE journey_id = %s;
+            """,
+            (journey_id,),
+        )
+        count_row = cursor.fetchone()
+        booking_count = count_row[0] if count_row else 0
+
+        if booking_count > 0:
+            return _error_response(
+                409,
+                f"Cannot delete journey because it is associated with {booking_count} existing booking(s). Please cancel the journey instead of deleting.",
+            )
+
+        try:
+            cursor.execute("DELETE FROM journeys WHERE id = %s;", (journey_id,))
+            conn.commit()
+        except Exception as del_exc:
+            conn.rollback()
+            err_msg = str(del_exc).lower()
+            if "foreign key" in err_msg or "restrict" in err_msg or "violates" in err_msg:
+                return _error_response(
+                    409,
+                    "Cannot delete journey because related database records depend on it.",
+                )
+            raise
+
+        _log("INFO", "Journey deleted successfully", journey_id=journey_id)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "message": "Journey deleted successfully",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in delete_journey handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ─── Main Lambda handler ────────────────────────────────────────────────────
+
 
 
 def lambda_handler(
@@ -1657,6 +2297,29 @@ def lambda_handler(
             return _handle_update_vehicle(event, v_id)
         if method == "DELETE":
             return _handle_delete_vehicle(event, v_id)
+
+    # ─── Journey Routes ─────────────────────────────────────────────
+    if clean_path == "/journeys" or path == "/journeys":
+        if method == "POST":
+            return _handle_create_journey(event)
+        if method == "GET":
+            return _handle_list_journeys(event)
+
+    journey_match = JOURNEY_PATH_REGEX.match(clean_path) or JOURNEY_PATH_REGEX.match(path)
+    j_id = None
+    if journey_match:
+        j_id = journey_match.group(1)
+    elif event.get("pathParameters") and "id" in event["pathParameters"]:
+        if clean_path.startswith("/journeys"):
+            j_id = event["pathParameters"]["id"]
+
+    if j_id:
+        if method == "GET":
+            return _handle_get_journey(event, j_id)
+        if method in ("PUT", "PATCH"):
+            return _handle_update_journey(event, j_id)
+        if method == "DELETE":
+            return _handle_delete_journey(event, j_id)
 
     # ─── Unknown route ──────────────────────────────────────────────
 
