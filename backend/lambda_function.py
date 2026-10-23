@@ -40,6 +40,7 @@ NOT implemented here (reserved for Step 4):
 
 
 import base64
+import datetime
 import json
 import logging
 import os
@@ -90,6 +91,19 @@ from journeys import (
     validate_departure_date,
     validate_endpoints,
     validate_journey_payload,
+)
+from bookings import (
+    ALLOWED_BOOKING_STATUSES,
+    ALLOWED_PAYMENT_STATUSES,
+    JOINED_BOOKING_SELECT,
+    format_booking_row,
+    generate_booking_reference,
+    validate_booking_status,
+    validate_create_booking_payload,
+    validate_location_note,
+    validate_payment_status,
+    validate_seats_booked,
+    validate_status_transition,
 )
 
 
@@ -2210,6 +2224,708 @@ def _handle_delete_journey(event: dict, journey_id: str) -> dict:
                 pass
 
 
+# ─── Booking Routes Handlers ────────────────────────────────────────────────
+
+BOOKING_PATH_REGEX = re.compile(r"^/bookings/([a-zA-Z0-9_-]{1,64})$")
+BOOKING_CANCEL_PATH_REGEX = re.compile(r"^/bookings/([a-zA-Z0-9_-]{1,64})/cancel$")
+
+
+def _handle_create_booking(event: dict) -> dict:
+    """
+    POST /bookings
+    Book seats on an active journey for the authenticated passenger.
+    Enforces concurrency locking (SELECT ... FOR UPDATE), prevents overbooking,
+    rejects self-booking by the driver, calculates total price server-side,
+    and derives passenger identity strictly from the JWT.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    try:
+        validated = validate_create_booking_payload(body)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        # Derive passenger identity
+        passenger_id = user["id"]
+        # Allow admin to book on behalf of a specific passenger if requested
+        if user["role"] == "admin":
+            specified_passenger = body.get("passengerId") or body.get("passenger_id")
+            if specified_passenger:
+                cursor.execute(
+                    "SELECT id, role, status FROM users WHERE id = %s;",
+                    (specified_passenger,),
+                )
+                p_row = cursor.fetchone()
+                if not p_row:
+                    return _error_response(404, "Specified passenger not found.")
+                if p_row[2] != "active":
+                    return _error_response(400, "Specified passenger account is not active.")
+                passenger_id = str(p_row[0])
+
+        journey_id = validated["journey_id"]
+        seats_requested = validated["seats_booked"]
+
+        # Lock the journey row in this transaction to prevent concurrent race conditions
+        cursor.execute(
+            """
+            SELECT
+                id, driver_id, vehicle_id, origin, destination,
+                departure_date, departure_time, arrival_time,
+                total_seats, available_seats, price_per_seat,
+                status
+            FROM journeys
+            WHERE id = %s
+            FOR UPDATE;
+            """,
+            (journey_id,),
+        )
+        j_row = cursor.fetchone()
+        if not j_row:
+            return _error_response(404, "Journey not found.")
+
+        j_driver_id = str(j_row[1])
+        j_dep_date = j_row[5]
+        j_avail_seats = int(j_row[9])
+        j_price_per_seat = float(j_row[10])
+        j_status = str(j_row[11])
+
+        # 1. Journey must be active
+        if j_status != "active":
+            return _error_response(400, f"Cannot book seats on a journey with status '{j_status}'.")
+
+        # 2. Driver cannot book their own journey
+        if j_driver_id == passenger_id:
+            return _error_response(403, "Driver cannot book seats on their own journey.")
+
+        # 3. Journey departure must not have passed
+        today = datetime.date.today()
+        dep_date_obj = j_dep_date
+        if isinstance(j_dep_date, str):
+            try:
+                dep_date_obj = datetime.date.fromisoformat(j_dep_date)
+            except ValueError:
+                pass
+        if isinstance(dep_date_obj, datetime.date) and dep_date_obj < today:
+            return _error_response(400, "Cannot book a journey whose departure date has already passed.")
+
+        # 4. Check seat availability
+        if j_avail_seats < seats_requested:
+            return _error_response(
+                409,
+                f"Not enough seats available. Requested {seats_requested}, but only {j_avail_seats} remaining.",
+            )
+
+        # 5. Check duplicate active booking for this passenger on this journey
+        cursor.execute(
+            """
+            SELECT id FROM bookings
+            WHERE journey_id = %s AND passenger_id = %s AND status != 'cancelled';
+            """,
+            (journey_id, passenger_id),
+        )
+        if cursor.fetchone():
+            return _error_response(409, "You already have an active booking for this journey.")
+
+        # Calculate total price server-side
+        total_price = round(seats_requested * j_price_per_seat, 2)
+
+        # Generate unique booking reference
+        booking_ref = generate_booking_reference()
+
+        # Atomically deduct available seats
+        cursor.execute(
+            """
+            UPDATE journeys
+            SET available_seats = available_seats - %s
+            WHERE id = %s;
+            """,
+            (seats_requested, journey_id),
+        )
+
+        # Insert new booking
+        cursor.execute(
+            """
+            INSERT INTO bookings (
+                booking_reference, journey_id, passenger_id, seats_booked,
+                total_price, status, payment_status, pickup_location, dropoff_location
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                booking_ref,
+                journey_id,
+                passenger_id,
+                seats_requested,
+                total_price,
+                "confirmed",
+                "unpaid",
+                validated["pickup_location"],
+                validated["dropoff_location"],
+            ),
+        )
+        new_row = cursor.fetchone()
+        booking_id = str(new_row[0])
+
+        # Fetch joined booking record
+        cursor.execute(
+            f"{JOINED_BOOKING_SELECT} WHERE b.id = %s;",
+            (booking_id,),
+        )
+        joined_row = cursor.fetchone()
+        conn.commit()
+
+        booking_data = format_booking_row(joined_row)
+        _log(
+            "INFO",
+            "Booking created successfully",
+            booking_id=booking_id,
+            booking_reference=booking_ref,
+            journey_id=journey_id,
+            passenger_id=passenger_id,
+            seats_booked=seats_requested,
+            total_price=total_price,
+        )
+
+        return _response(
+            201,
+            {
+                "success": True,
+                "booking": booking_data,
+                "message": "Booking confirmed successfully. Payment processing is not yet implemented (status: unpaid).",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        _log("ERROR", "Unhandled exception in create_booking handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_list_bookings(event: dict) -> dict:
+    """
+    GET /bookings
+    List bookings for the authenticated user.
+    - Passenger: returns their own booking history.
+    - Driver: returns bookings for their journeys (or where they are passenger).
+    - Admin: can view all bookings or filter by passenger, journey, or status.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        params = event.get("queryStringParameters") or {}
+        filter_passenger = params.get("passengerId") or params.get("passenger_id")
+        filter_journey = params.get("journeyId") or params.get("journey_id")
+        filter_status = params.get("status")
+        as_role = params.get("as") or params.get("role")
+
+        where_clauses = []
+        sql_params = []
+
+        user_id = user["id"]
+        role = user["role"]
+
+        if role == "admin":
+            if filter_passenger:
+                where_clauses.append("b.passenger_id = %s")
+                sql_params.append(filter_passenger)
+            if filter_journey:
+                where_clauses.append("b.journey_id = %s")
+                sql_params.append(filter_journey)
+        elif role == "passenger":
+            where_clauses.append("b.passenger_id = %s")
+            sql_params.append(user_id)
+            if filter_journey:
+                where_clauses.append("b.journey_id = %s")
+                sql_params.append(filter_journey)
+        elif role == "driver":
+            if as_role == "driver":
+                where_clauses.append("j.driver_id = %s")
+                sql_params.append(user_id)
+            elif as_role == "passenger":
+                where_clauses.append("b.passenger_id = %s")
+                sql_params.append(user_id)
+            elif filter_journey:
+                where_clauses.append("b.journey_id = %s")
+                sql_params.append(filter_journey)
+                where_clauses.append("(j.driver_id = %s OR b.passenger_id = %s)")
+                sql_params.extend([user_id, user_id])
+            else:
+                where_clauses.append("(j.driver_id = %s OR b.passenger_id = %s)")
+                sql_params.extend([user_id, user_id])
+        else:
+            return _error_response(403, "Unauthorized role.")
+
+        if filter_status:
+            try:
+                valid_status = validate_booking_status(filter_status)
+                where_clauses.append("b.status = %s")
+                sql_params.append(valid_status)
+            except ValueError:
+                return _error_response(400, f"Invalid status filter '{filter_status}'.")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        query = f"""
+        {JOINED_BOOKING_SELECT}
+        {where_sql}
+        ORDER BY b.created_at DESC;
+        """
+
+        cursor.execute(query, tuple(sql_params))
+        rows = cursor.fetchall()
+        bookings = [format_booking_row(r) for r in rows]
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "bookings": bookings,
+                "count": len(bookings),
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in list_bookings handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_get_booking(event: dict, booking_id: str) -> dict:
+    """
+    GET /bookings/{id}
+    Retrieve booking details by ID or reference.
+    Enforces ownership: accessible only by the passenger, journey driver, or admin.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        cursor.execute(
+            f"""
+            {JOINED_BOOKING_SELECT}
+            WHERE b.id = %s OR b.booking_reference = %s;
+            """,
+            (booking_id, booking_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return _error_response(404, "Booking not found.")
+
+        passenger_id = str(row[3])
+        driver_id = str(row[30])
+        user_id = user["id"]
+
+        is_passenger = user_id == passenger_id
+        is_driver = user_id == driver_id
+        is_admin = user["role"] == "admin"
+
+        if not (is_passenger or is_driver or is_admin):
+            return _error_response(403, "Forbidden: You do not have permission to view this booking.")
+
+        booking_data = format_booking_row(row)
+        return _response(
+            200,
+            {
+                "success": True,
+                "booking": booking_data,
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        _log("ERROR", "Unhandled exception in get_booking handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_update_booking(event: dict, booking_id: str) -> dict:
+    """
+    PATCH /bookings/{id}
+    Update booking details or perform explicit safe status transitions.
+    If transitioned to 'cancelled', releases seats back to the journey exactly once.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    try:
+        body = _parse_body(event)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        # Lock booking and journey info
+        cursor.execute(
+            """
+            SELECT b.id, b.journey_id, b.passenger_id, b.seats_booked, b.status, b.payment_status,
+                   b.pickup_location, b.dropoff_location, j.driver_id
+            FROM bookings b
+            JOIN journeys j ON b.journey_id = j.id
+            WHERE b.id = %s
+            FOR UPDATE OF b;
+            """,
+            (booking_id,),
+        )
+        b_row = cursor.fetchone()
+        if not b_row:
+            return _error_response(404, "Booking not found.")
+
+        b_id = str(b_row[0])
+        journey_id = str(b_row[1])
+        passenger_id = str(b_row[2])
+        seats_booked = int(b_row[3])
+        current_status = str(b_row[4])
+        current_payment = str(b_row[5])
+        current_pickup = b_row[6]
+        current_dropoff = b_row[7]
+        driver_id = str(b_row[8])
+
+        user_id = user["id"]
+        is_passenger = user_id == passenger_id
+        is_driver = user_id == driver_id
+        is_admin = user["role"] == "admin"
+
+        if not (is_passenger or is_driver or is_admin):
+            return _error_response(403, "Forbidden: You do not have permission to update this booking.")
+
+        new_status = current_status
+        if "status" in body:
+            try:
+                requested_status = validate_booking_status(body["status"])
+                validate_status_transition(current_status, requested_status)
+            except ValueError as exc:
+                return _error_response(400, str(exc))
+
+            if is_passenger and not is_admin:
+                if requested_status != current_status and requested_status != "cancelled":
+                    return _error_response(403, "Passengers may only cancel bookings.")
+
+            new_status = requested_status
+
+        new_payment = current_payment
+        if "paymentStatus" in body or "payment_status" in body:
+            if not (is_admin or is_driver):
+                return _error_response(403, "Only driver or admin can update payment status.")
+            try:
+                new_payment = validate_payment_status(
+                    body.get("paymentStatus") or body.get("payment_status")
+                )
+            except ValueError as exc:
+                return _error_response(400, str(exc))
+
+        new_pickup = current_pickup
+        if "pickupLocation" in body or "pickup_location" in body:
+            try:
+                new_pickup = validate_location_note(
+                    body.get("pickupLocation") or body.get("pickup_location"),
+                    "Pickup location",
+                )
+            except ValueError as exc:
+                return _error_response(400, str(exc))
+
+        new_dropoff = current_dropoff
+        if "dropoffLocation" in body or "dropoff_location" in body:
+            try:
+                new_dropoff = validate_location_note(
+                    body.get("dropoffLocation") or body.get("dropoff_location"),
+                    "Dropoff location",
+                )
+            except ValueError as exc:
+                return _error_response(400, str(exc))
+
+        # If transitioning to cancelled, release seats exactly once
+        if current_status != "cancelled" and new_status == "cancelled":
+            cursor.execute(
+                """
+                SELECT id, total_seats, available_seats
+                FROM journeys
+                WHERE id = %s
+                FOR UPDATE;
+                """,
+                (journey_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE journeys
+                SET available_seats = LEAST(total_seats, available_seats + %s)
+                WHERE id = %s;
+                """,
+                (seats_booked, journey_id),
+            )
+
+        cursor.execute(
+            """
+            UPDATE bookings
+            SET status = %s,
+                payment_status = %s,
+                pickup_location = %s,
+                dropoff_location = %s
+            WHERE id = %s;
+            """,
+            (new_status, new_payment, new_pickup, new_dropoff, b_id),
+        )
+
+        cursor.execute(
+            f"{JOINED_BOOKING_SELECT} WHERE b.id = %s;",
+            (b_id,),
+        )
+        joined_row = cursor.fetchone()
+        conn.commit()
+
+        booking_data = format_booking_row(joined_row)
+        _log("INFO", "Booking updated successfully", booking_id=b_id, new_status=new_status)
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "booking": booking_data,
+                "message": "Booking updated successfully.",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        _log("ERROR", "Unhandled exception in update_booking handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_cancel_booking(event: dict, booking_id: str) -> dict:
+    """
+    POST /bookings/{id}/cancel
+    Cancel a booking and release reserved seats back to the journey.
+    Guarantees exactly-once seat restoration within a transaction.
+    Accessible by the passenger, journey driver, or admin.
+    """
+    claims, auth_err = _extract_auth_claims(event)
+    if auth_err:
+        return auth_err
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+
+        user, auth_err = _get_authenticated_user(event, cursor)
+        if auth_err:
+            return auth_err
+
+        # Lock booking and journey info
+        cursor.execute(
+            """
+            SELECT b.id, b.journey_id, b.passenger_id, b.seats_booked, b.status, j.driver_id
+            FROM bookings b
+            JOIN journeys j ON b.journey_id = j.id
+            WHERE b.id = %s
+            FOR UPDATE OF b;
+            """,
+            (booking_id,),
+        )
+        b_row = cursor.fetchone()
+        if not b_row:
+            return _error_response(404, "Booking not found.")
+
+        b_id = str(b_row[0])
+        journey_id = str(b_row[1])
+        passenger_id = str(b_row[2])
+        seats_booked = int(b_row[3])
+        current_status = str(b_row[4])
+        driver_id = str(b_row[5])
+
+        user_id = user["id"]
+        is_passenger = user_id == passenger_id
+        is_driver = user_id == driver_id
+        is_admin = user["role"] == "admin"
+
+        if not (is_passenger or is_driver or is_admin):
+            return _error_response(403, "Forbidden: You do not have permission to cancel this booking.")
+
+        if current_status == "cancelled":
+            return _error_response(409, "Booking is already cancelled.")
+
+        if current_status == "completed":
+            return _error_response(409, "Cannot cancel a completed booking.")
+
+        # Lock journey row and restore available seats exactly once
+        cursor.execute(
+            """
+            SELECT id, total_seats, available_seats
+            FROM journeys
+            WHERE id = %s
+            FOR UPDATE;
+            """,
+            (journey_id,),
+        )
+        j_row = cursor.fetchone()
+        if not j_row:
+            return _error_response(404, "Referenced journey not found.")
+
+        cursor.execute(
+            """
+            UPDATE journeys
+            SET available_seats = LEAST(total_seats, available_seats + %s)
+            WHERE id = %s;
+            """,
+            (seats_booked, journey_id),
+        )
+
+        cursor.execute(
+            """
+            UPDATE bookings
+            SET status = 'cancelled'
+            WHERE id = %s;
+            """,
+            (b_id,),
+        )
+
+        cursor.execute(
+            f"{JOINED_BOOKING_SELECT} WHERE b.id = %s;",
+            (b_id,),
+        )
+        joined_row = cursor.fetchone()
+        conn.commit()
+
+        booking_data = format_booking_row(joined_row)
+        _log(
+            "INFO",
+            "Booking cancelled successfully",
+            booking_id=b_id,
+            journey_id=journey_id,
+            seats_restored=seats_booked,
+        )
+
+        return _response(
+            200,
+            {
+                "success": True,
+                "booking": booking_data,
+                "message": f"Booking cancelled successfully. {seats_booked} seat(s) released.",
+            },
+        )
+    except RuntimeError:
+        return _error_response(503, "Database unavailable.")
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        _log("ERROR", "Unhandled exception in cancel_booking handler", error_type=type(exc).__name__)
+        return _error_response(500, "Internal server error.")
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ─── Main Lambda handler ────────────────────────────────────────────────────
 
 
@@ -2320,6 +3036,41 @@ def lambda_handler(
             return _handle_update_journey(event, j_id)
         if method == "DELETE":
             return _handle_delete_journey(event, j_id)
+
+    # ─── Booking Routes ─────────────────────────────────────────────
+    # Cancel endpoint: POST /bookings/{id}/cancel
+    cancel_match = BOOKING_CANCEL_PATH_REGEX.match(clean_path) or BOOKING_CANCEL_PATH_REGEX.match(path)
+    b_cancel_id = None
+    if cancel_match:
+        b_cancel_id = cancel_match.group(1)
+    elif event.get("pathParameters") and "id" in event["pathParameters"] and clean_path.endswith("/cancel"):
+        b_cancel_id = event["pathParameters"]["id"]
+
+    if b_cancel_id:
+        if method in ("POST", "PATCH"):
+            return _handle_cancel_booking(event, b_cancel_id)
+
+    if clean_path == "/bookings" or path == "/bookings":
+        if method == "POST":
+            return _handle_create_booking(event)
+        if method == "GET":
+            return _handle_list_bookings(event)
+
+    booking_match = BOOKING_PATH_REGEX.match(clean_path) or BOOKING_PATH_REGEX.match(path)
+    b_id = None
+    if booking_match:
+        b_id = booking_match.group(1)
+    elif event.get("pathParameters") and "id" in event["pathParameters"]:
+        if clean_path.startswith("/bookings"):
+            b_id = event["pathParameters"]["id"]
+
+    if b_id:
+        if method == "GET":
+            return _handle_get_booking(event, b_id)
+        if method in ("PUT", "PATCH"):
+            return _handle_update_booking(event, b_id)
+        if method == "DELETE":
+            return _handle_cancel_booking(event, b_id)
 
     # ─── Unknown route ──────────────────────────────────────────────
 

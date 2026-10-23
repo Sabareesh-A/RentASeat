@@ -9,11 +9,8 @@ import type {
   ApiResponse,
   RegisterData,
 } from '../types';
-import { BookingStatus } from '../types';
 import { request, ApiError } from '../api/client';
 import {
-  getJourneyById,
-  getBookingsByPassengerId,
   getUserById,
   mockUsers,
 } from '../data/mock';
@@ -294,85 +291,172 @@ export const journeyService = {
   },
 };
 
+interface BookingApiResponse {
+  success: boolean;
+  booking?: Booking;
+  bookings?: Booking[];
+  count?: number;
+  message?: string;
+  error?: string;
+}
+
 // Booking Service
 export const bookingService = {
-  // Get bookings by passenger
-  async getBookingsByPassenger(passengerId: string): Promise<ApiResponse<Booking[]>> {
+  // Get bookings by passenger (or current authenticated user)
+  async getBookingsByPassenger(passengerId?: string): Promise<ApiResponse<Booking[]>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      return {
-        success: true,
-        data: getBookingsByPassengerId(passengerId),
-      };
-    } catch {
+      const endpoint = passengerId ? `/bookings?passengerId=${encodeURIComponent(passengerId)}` : '/bookings';
+      const response = await request<BookingApiResponse>(endpoint, {
+        method: 'GET',
+      });
+      if (response.success && response.bookings) {
+        return {
+          success: true,
+          data: response.bookings,
+        };
+      }
       return {
         success: false,
-        error: 'Failed to fetch bookings',
+        error: response.error || 'Failed to fetch bookings',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch bookings';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Get single booking by ID or reference
+  async getBookingById(id: string): Promise<ApiResponse<Booking>> {
+    try {
+      const response = await request<BookingApiResponse>(`/bookings/${id}`, {
+        method: 'GET',
+      });
+      if (response.success && response.booking) {
+        return {
+          success: true,
+          data: response.booking,
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to fetch booking',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to fetch booking';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
 
   // Create booking
-  async createBooking(journeyId: string, passengerId: string, seatsBooked: number): Promise<ApiResponse<Booking>> {
+  async createBooking(
+    journeyId: string,
+    passengerId?: string,
+    seatsBooked: number = 1,
+    pickupLocation?: string,
+    dropoffLocation?: string
+  ): Promise<ApiResponse<Booking>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-
-      const journey = getJourneyById(journeyId);
-      if (!journey || journey.availableSeats < seatsBooked) {
-        return {
-          success: false,
-          error: 'Not enough seats available',
-        };
-      }
-
-      const passenger = getUserById(passengerId);
-      if (!passenger) {
-        return {
-          success: false,
-          error: 'Passenger not found',
-        };
-      }
-
-      const totalPrice = journey.pricePerSeat * seatsBooked;
-
-      const newBooking: Booking = {
-        id: `booking_${Date.now()}`,
+      const payload: Record<string, any> = {
         journeyId,
-        passengerId,
-        passenger,
-        journey,
         seatsBooked,
-        totalPrice,
-        status: BookingStatus.PENDING,
-        bookingReference: `REN${Math.random().toString(36).substr(2, 9).toUpperCase()}`,
-        createdAt: new Date(),
       };
+      if (passengerId) {
+        payload.passengerId = passengerId;
+      }
+      if (pickupLocation) {
+        payload.pickupLocation = pickupLocation;
+      }
+      if (dropoffLocation) {
+        payload.dropoffLocation = dropoffLocation;
+      }
 
-      return {
-        success: true,
-        data: newBooking,
-        message: 'Booking created successfully',
-      };
-    } catch {
+      const response = await request<BookingApiResponse>('/bookings', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+
+      if (response.success && response.booking) {
+        return {
+          success: true,
+          data: response.booking,
+          message: response.message || 'Booking created successfully',
+        };
+      }
       return {
         success: false,
-        error: 'Failed to create booking',
+        error: response.error || 'Failed to create booking',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to create booking';
+      return {
+        success: false,
+        error: message,
+      };
+    }
+  },
+
+  // Update booking details or status
+  async updateBooking(
+    bookingId: string,
+    updates: {
+      status?: string;
+      paymentStatus?: string;
+      pickupLocation?: string;
+      dropoffLocation?: string;
+    }
+  ): Promise<ApiResponse<Booking>> {
+    try {
+      const response = await request<BookingApiResponse>(`/bookings/${bookingId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+      });
+      if (response.success && response.booking) {
+        return {
+          success: true,
+          data: response.booking,
+          message: response.message || 'Booking updated successfully',
+        };
+      }
+      return {
+        success: false,
+        error: response.error || 'Failed to update booking',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to update booking';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
 
   // Cancel booking
-  async cancelBooking(_bookingId: string): Promise<ApiResponse<void>> {
+  async cancelBooking(bookingId: string): Promise<ApiResponse<void>> {
     try {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      return {
-        success: true,
-        message: 'Booking cancelled successfully',
-      };
-    } catch {
+      const response = await request<BookingApiResponse>(`/bookings/${bookingId}/cancel`, {
+        method: 'POST',
+      });
+      if (response.success) {
+        return {
+          success: true,
+          message: response.message || 'Booking cancelled successfully',
+        };
+      }
       return {
         success: false,
-        error: 'Failed to cancel booking',
+        error: response.error || 'Failed to cancel booking',
+      };
+    } catch (err) {
+      const message = err instanceof ApiError ? err.message : 'Failed to cancel booking';
+      return {
+        success: false,
+        error: message,
       };
     }
   },
